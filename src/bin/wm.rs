@@ -157,6 +157,7 @@ const fn status_label(s: ChildStatus) -> &'static str {
         ChildStatus::Pending => "pending",
         ChildStatus::Starting => "starting",
         ChildStatus::Running => "running",
+        ChildStatus::Exited => "exited",
         ChildStatus::Backoff => "backoff",
         ChildStatus::Halted => "halted",
     }

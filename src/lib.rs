@@ -1,12 +1,12 @@
 //! wintermute-platform — supervisor + CLI library.
 //!
-//! Iter-4 surface: iter-3 (UDS protocol + in-memory supervisor) plus a
-//! `spawn` module exposing a pluggable [`spawn::Spawner`] trait and a
-//! real [`spawn::PeventSpawner`] implementation that shells out to
-//! `pevent run` (PRD §2.3 Option A). `Supervisor::start_all` walks the
-//! canonical child order and drives each entry through Pending →
-//! Starting → Running. Exit observation, restart policy, mute plumbing,
-//! log tailing, and agorabus publishing land in iter-5+.
+//! Iter-5 surface: iter-4 ([`spawn::Spawner`] + `start_all`) plus exit
+//! observation. [`spawn::Spawner`] gains a `still_running` liveness
+//! probe; [`supervisor::Supervisor::observe_exits`] uses it to
+//! transition `Running → Exited` on PID loss. The `wmd-init` binary
+//! opt-ins via `--spawn` to run `start_all` + a 1 s observation loop.
+//! Restart policy, mute plumbing, log tailing, and agorabus publishing
+//! land in iter-6+.
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 

@@ -1,16 +1,15 @@
 //! In-memory supervisor state + UDS server.
 //!
-//! Iter-4 surface: everything iter-3 had (bind `socket_path()`, accept
-//! clients, answer `Request::Status` with the snapshot, respond
-//! `NotImplemented` to anything else) plus `start_all` / `start_specs`:
-//! a library-side entry point that walks a `ChildSpec` list against a
-//! pluggable [`Spawner`], transitioning each child Pending → Starting →
-//! Running and recording the returned PID. Exit observation and the
-//! restart-on-crash loop land in iter-5.
+//! Iter-5 surface: everything iter-4 had (UDS server, `start_all` /
+//! `start_specs` against a pluggable [`Spawner`]) plus an
+//! `observe_exits` pass that asks the spawner about each `Running`
+//! child and transitions `Running → Exited` on PID loss. `wmd-init`
+//! now opt-ins via the `--spawn` flag to call `start_all` and the
+//! observer loop; without it the binary still serves a pending view
+//! (preserves AC9).
 //!
-//! `wmd-init` does not yet call `start_all`; the binary still serves
-//! status from a pending view (preserves AC9 behavior). Tests exercise
-//! the new API directly via a stub spawner.
+//! Restart-on-exit policy lives in iter-6 (`RestartTracker`
+//! integration); this iter only detects the transition.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -93,6 +92,47 @@ impl Supervisor {
             }
         }
         Ok(())
+    }
+
+    /// One observation pass: visit every `Running` child with a known
+    /// PID and ask `spawner.still_running`. On `Ok(false)` flip the
+    /// slot to [`ChildStatus::Exited`] and record the event. Other
+    /// statuses (Pending/Starting/Backoff/Halted/Exited) are skipped.
+    /// Returns the names that just transitioned, in order encountered.
+    ///
+    /// # Errors
+    /// Surfaces the first `Spawner::still_running` error encountered.
+    pub async fn observe_exits<S: Spawner + ?Sized>(
+        &self,
+        spawner: &S,
+    ) -> Result<Vec<String>> {
+        let snapshot: Vec<(String, u32)> = {
+            let g = self.state.lock().await;
+            g.children
+                .iter()
+                .filter(|c| c.status == ChildStatus::Running)
+                .filter_map(|c| c.child_pid.map(|p| (c.name.clone(), p)))
+                .collect()
+        };
+        let mut transitions = Vec::new();
+        for (name, pid) in snapshot {
+            let alive = spawner
+                .still_running(pid)
+                .with_context(|| format!("probe still_running for {name} pid={pid}"))?;
+            if !alive {
+                let mut g = self.state.lock().await;
+                if let Some(slot) = g
+                    .children
+                    .iter_mut()
+                    .find(|c| c.name == name && c.status == ChildStatus::Running)
+                {
+                    slot.status = ChildStatus::Exited;
+                    slot.last_event = Some(format!("exited (lost pid {pid})"));
+                    transitions.push(name);
+                }
+            }
+        }
+        Ok(transitions)
     }
 
     /// Bind `socket_path` and serve forever. Parent directory is
@@ -260,6 +300,67 @@ mod tests {
             stub.called_names(),
             vec!["wm-audio", "wm-tts", "wm-stt", "wm-dialog", "wmd"],
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observe_exits_flips_running_to_exited_when_pid_gone() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(40_000);
+        let sup = Supervisor::new();
+        sup.start_all(&stub).await?;
+        let pid_audio = sup
+            .snapshot()
+            .await
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .and_then(|c| c.child_pid)
+            .ok_or_else(|| anyhow::anyhow!("wm-audio missing pid"))?;
+        stub.mark_exited(pid_audio);
+        let transitions = sup.observe_exits(&stub).await?;
+        assert_eq!(transitions, vec!["wm-audio".to_string()]);
+        let view = sup.snapshot().await;
+        let audio = view
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .ok_or_else(|| anyhow::anyhow!("wm-audio absent"))?;
+        assert_eq!(audio.status, ChildStatus::Exited);
+        assert_eq!(
+            audio.last_event.as_deref(),
+            Some(format!("exited (lost pid {pid_audio})").as_str())
+        );
+        // Siblings still Running.
+        for other in view.children.iter().filter(|c| c.name != "wm-audio") {
+            assert_eq!(other.status, ChildStatus::Running, "{}", other.name);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observe_exits_is_idempotent_when_nothing_changed() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(50_000);
+        let sup = Supervisor::new();
+        sup.start_all(&stub).await?;
+        let t1 = sup.observe_exits(&stub).await?;
+        let t2 = sup.observe_exits(&stub).await?;
+        assert!(t1.is_empty());
+        assert!(t2.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observe_exits_skips_pending_and_starting_slots() -> Result<()> {
+        // Nothing started — observation pass must do nothing.
+        let stub = crate::spawn::testing::StubSpawner::new(60_000);
+        let sup = Supervisor::new();
+        let transitions = sup.observe_exits(&stub).await?;
+        assert!(transitions.is_empty());
+        // And subsequent snapshot shows all five still Pending.
+        let view = sup.snapshot().await;
+        for c in &view.children {
+            assert_eq!(c.status, ChildStatus::Pending);
+        }
         Ok(())
     }
 

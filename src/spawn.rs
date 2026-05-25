@@ -1,14 +1,13 @@
-//! Pluggable child-process launcher.
+//! Pluggable child-process launcher + liveness probe.
 //!
-//! Iter-4 surface: a `Spawner` trait the supervisor consults to start
-//! a child, plus a `PeventSpawner` impl that shells out to `pevent run`
-//! (PRD §2.3 Option A — recommended path). The trait exists so tests
-//! can substitute a deterministic stub without touching the real
-//! process table.
-//!
-//! Exit observation, restart policy, and supervisor-side bookkeeping
-//! land in iter-5. This module only handles the start side.
+//! Iter-5 surface: the iter-4 [`Spawner::start`] entry point plus a
+//! [`Spawner::still_running`] liveness probe. `PeventSpawner` reads
+//! `/proc/<pid>` to answer the probe; `StubSpawner` consults an
+//! in-memory map controlled by tests. The supervisor uses the probe
+//! to transition a `Running` slot to `Exited` when the kernel drops
+//! the PID. Restart policy itself lives in iter-6.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow};
@@ -34,6 +33,15 @@ pub trait Spawner: Send + Sync {
     /// # Errors
     /// Implementations bubble any failure to launch or parse the launcher's response.
     fn start(&self, spec: &ChildSpec) -> Result<StartedChild>;
+
+    /// Liveness probe. Returns `Ok(true)` while the process named by
+    /// `child_pid` is still in the process table, `Ok(false)` once it
+    /// is gone. Implementations may use any side-effect-free check.
+    ///
+    /// # Errors
+    /// Surfaces any unexpected I/O error (`NotFound` is the expected
+    /// not-running signal and must be reported as `Ok(false)`).
+    fn still_running(&self, child_pid: u32) -> Result<bool>;
 }
 
 /// Real launcher: shells out to `pevent run --id <name> -- <exec> <args...>`.
@@ -91,6 +99,15 @@ impl Spawner for PeventSpawner {
             supervisor_pid: reply.supervisor_pid,
         })
     }
+
+    fn still_running(&self, child_pid: u32) -> Result<bool> {
+        let path = PathBuf::from(format!("/proc/{child_pid}"));
+        match std::fs::metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -98,6 +115,7 @@ impl Spawner for PeventSpawner {
 pub(crate) mod testing {
     use super::{Result, Spawner, StartedChild};
     use crate::ChildSpec;
+    use std::collections::HashSet;
     use std::sync::Mutex;
 
     /// Deterministic stub: returns synthetic PIDs and records the names it was asked to start.
@@ -107,19 +125,28 @@ pub(crate) mod testing {
         pub calls: Mutex<Vec<String>>,
         /// Base PID. The Nth call returns `base_pid + N`.
         pub base_pid: u32,
+        /// PIDs that the test wants `still_running` to report as gone.
+        pub exited: Mutex<HashSet<u32>>,
     }
 
     impl StubSpawner {
         /// Fresh stub with no recorded calls.
-        pub const fn new(base_pid: u32) -> Self {
+        pub fn new(base_pid: u32) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
                 base_pid,
+                exited: Mutex::new(HashSet::new()),
             }
         }
         /// Snapshot of the names this stub has been asked to start.
         pub fn called_names(&self) -> Vec<String> {
             self.calls.lock().map_or_else(|_| Vec::new(), |g| g.clone())
+        }
+        /// Mark `pid` as exited; subsequent `still_running(pid)` returns `false`.
+        pub fn mark_exited(&self, pid: u32) {
+            if let Ok(mut g) = self.exited.lock() {
+                g.insert(pid);
+            }
         }
     }
 
@@ -138,6 +165,14 @@ pub(crate) mod testing {
                 child_pid: self.base_pid + n_after,
                 supervisor_pid: 0,
             })
+        }
+
+        fn still_running(&self, child_pid: u32) -> Result<bool> {
+            let g = self
+                .exited
+                .lock()
+                .map_err(|e| anyhow::anyhow!("stub lock poisoned: {e}"))?;
+            Ok(!g.contains(&child_pid))
         }
     }
 }
@@ -175,6 +210,38 @@ mod tests {
         assert_eq!(r.id, "wm-audio");
         assert_eq!(r.child_pid, 4242);
         assert_eq!(r.supervisor_pid, 4241);
+        Ok(())
+    }
+
+    #[test]
+    fn stub_still_running_flips_on_mark_exited() -> Result<()> {
+        let stub = StubSpawner::new(30_000);
+        let a = stub.start(&ChildSpec {
+            name: "wm-audio".into(),
+            exec: "wm-audio".into(),
+            args: vec![],
+        })?;
+        assert!(stub.still_running(a.child_pid)?);
+        stub.mark_exited(a.child_pid);
+        assert!(!stub.still_running(a.child_pid)?);
+        // An unrelated PID is unaffected.
+        assert!(stub.still_running(a.child_pid + 7)?);
+        Ok(())
+    }
+
+    #[test]
+    fn pevent_still_running_for_self_pid() -> Result<()> {
+        // Our own PID is always live while we're running.
+        let s = PeventSpawner::default();
+        assert!(s.still_running(std::process::id())?);
+        Ok(())
+    }
+
+    #[test]
+    fn pevent_still_running_false_for_impossible_pid() -> Result<()> {
+        // Linux pid_max ≤ 2^22 in practice; u32::MAX is guaranteed absent.
+        let s = PeventSpawner::default();
+        assert!(!s.still_running(u32::MAX)?);
         Ok(())
     }
 }

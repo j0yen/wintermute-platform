@@ -100,6 +100,9 @@ pub enum ChildStatus {
     Starting,
     /// Last observation: process alive.
     Running,
+    /// Last observation: process is gone (PID no longer in process table).
+    /// Restart policy (iter-6) decides whether to flip back to `Starting`.
+    Exited,
     /// Restart loop in backoff (>= storm threshold restarts in window).
     Backoff,
     /// Supervisor halted this child intentionally.
