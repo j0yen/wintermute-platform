@@ -1,10 +1,14 @@
 //! wintermute-platform — supervisor + CLI library.
 //!
-//! Iter-2 surface: core types and constants for the five-child wintermute
-//! supervisor (`wmd-init`) and its CLI (`wm`). Real child spawning, the
-//! Unix-socket protocol, and agorabus publishing land in iter-3+.
+//! Iter-3 surface: core types + constants (iter-2) plus a UDS protocol
+//! (`protocol`) and an in-memory `Supervisor` (`supervisor`) that
+//! answers `Request::Status` end-to-end. Real child spawning, mute
+//! plumbing, log tailing, and agorabus publishing land in iter-4+.
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
+
+pub mod protocol;
+pub mod supervisor;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
