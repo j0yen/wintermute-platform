@@ -1,13 +1,17 @@
 //! wintermute-platform — supervisor + CLI library.
 //!
-//! Iter-3 surface: core types + constants (iter-2) plus a UDS protocol
-//! (`protocol`) and an in-memory `Supervisor` (`supervisor`) that
-//! answers `Request::Status` end-to-end. Real child spawning, mute
-//! plumbing, log tailing, and agorabus publishing land in iter-4+.
+//! Iter-4 surface: iter-3 (UDS protocol + in-memory supervisor) plus a
+//! `spawn` module exposing a pluggable [`spawn::Spawner`] trait and a
+//! real [`spawn::PeventSpawner`] implementation that shells out to
+//! `pevent run` (PRD §2.3 Option A). `Supervisor::start_all` walks the
+//! canonical child order and drives each entry through Pending →
+//! Starting → Running. Exit observation, restart policy, mute plumbing,
+//! log tailing, and agorabus publishing land in iter-5+.
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod protocol;
+pub mod spawn;
 pub mod supervisor;
 
 use std::collections::{BTreeMap, VecDeque};

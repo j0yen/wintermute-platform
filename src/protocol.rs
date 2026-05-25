@@ -85,6 +85,9 @@ pub struct ChildState {
     pub restart_count: u32,
     /// Most recent supervisor event for this child, if any.
     pub last_event: Option<String>,
+    /// PID of the live supervised process, set once started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_pid: Option<u32>,
 }
 
 /// Lifecycle phase reported in `ChildState.status`.
@@ -113,6 +116,7 @@ impl ChildState {
             uptime_secs: 0,
             restart_count: 0,
             last_event: None,
+            child_pid: None,
         }
     }
 }

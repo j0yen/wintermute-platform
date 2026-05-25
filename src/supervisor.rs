@@ -1,12 +1,16 @@
 //! In-memory supervisor state + UDS server.
 //!
-//! Iter-3 surface: bind `socket_path()`, accept clients, answer
-//! `Request::Status` with a pending-children snapshot, and respond
-//! `NotImplemented` for everything else. Real child spawning, mute
-//! plumbing, log tailing, and TTS pass-through land in iter-4+.
+//! Iter-4 surface: everything iter-3 had (bind `socket_path()`, accept
+//! clients, answer `Request::Status` with the snapshot, respond
+//! `NotImplemented` to anything else) plus `start_all` / `start_specs`:
+//! a library-side entry point that walks a `ChildSpec` list against a
+//! pluggable [`Spawner`], transitioning each child Pending → Starting →
+//! Running and recording the returned PID. Exit observation and the
+//! restart-on-crash loop land in iter-5.
 //!
-//! The supervisor never panics on client errors — bad framing and
-//! disconnects are logged and the connection is dropped.
+//! `wmd-init` does not yet call `start_all`; the binary still serves
+//! status from a pending view (preserves AC9 behavior). Tests exercise
+//! the new API directly via a stub spawner.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -17,8 +21,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 
-use crate::canonical_children;
-use crate::protocol::{Request, Response, SupervisorView};
+use crate::protocol::{ChildStatus, Request, Response, SupervisorView};
+use crate::spawn::Spawner;
+use crate::{ChildSpec, canonical_children};
 
 /// In-memory snapshot + UDS server.
 #[derive(Debug, Clone)]
@@ -45,6 +50,49 @@ impl Supervisor {
     /// Read-only snapshot of the current state — useful for tests.
     pub async fn snapshot(&self) -> SupervisorView {
         self.state.lock().await.clone()
+    }
+
+    /// Start every child in canonical order via `spawner`. Transitions
+    /// each entry `Pending → Starting → Running` and records the
+    /// returned PID. Returns the first error if any child fails to
+    /// launch; already-started children stay `Running` (cleanup is the
+    /// caller's responsibility — iter-5 wires the restart loop).
+    ///
+    /// # Errors
+    /// Surfaces the underlying `Spawner::start` error verbatim.
+    pub async fn start_all<S: Spawner + ?Sized>(&self, spawner: &S) -> Result<()> {
+        self.start_specs(spawner, &canonical_children()).await
+    }
+
+    /// Variant of `start_all` that takes an explicit spec list — used by tests
+    /// to drive the supervisor with a one-child fixture rather than the full five.
+    ///
+    /// # Errors
+    /// Surfaces the underlying `Spawner::start` error verbatim.
+    pub async fn start_specs<S: Spawner + ?Sized>(
+        &self,
+        spawner: &S,
+        specs: &[ChildSpec],
+    ) -> Result<()> {
+        for spec in specs {
+            {
+                let mut g = self.state.lock().await;
+                if let Some(slot) = g.children.iter_mut().find(|c| c.name == spec.name) {
+                    slot.status = ChildStatus::Starting;
+                    slot.last_event = Some("starting".into());
+                }
+            }
+            let started = spawner
+                .start(spec)
+                .with_context(|| format!("start child {}", spec.name))?;
+            let mut g = self.state.lock().await;
+            if let Some(slot) = g.children.iter_mut().find(|c| c.name == spec.name) {
+                slot.status = ChildStatus::Running;
+                slot.child_pid = Some(started.child_pid);
+                slot.last_event = Some(format!("running pid={}", started.child_pid));
+            }
+        }
+        Ok(())
     }
 
     /// Bind `socket_path` and serve forever. Parent directory is
@@ -185,5 +233,62 @@ mod tests {
         let state = Mutex::new(SupervisorView::pending_for(&canonical_children()));
         let resp = dispatch(Request::Mute, &state).await;
         assert_eq!(resp, Response::NotImplemented { op: "mute".into() });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_all_marks_all_children_running_in_canonical_order() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(20_000);
+        let sup = Supervisor::new();
+        sup.start_all(&stub).await?;
+        let view = sup.snapshot().await;
+        let names: Vec<&str> = view.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["wm-audio", "wm-tts", "wm-stt", "wm-dialog", "wmd"]
+        );
+        for child in &view.children {
+            assert_eq!(child.status, ChildStatus::Running, "{}", child.name);
+            let pid = child
+                .child_pid
+                .ok_or_else(|| anyhow::anyhow!("{} missing pid", child.name))?;
+            assert_eq!(
+                child.last_event.as_deref(),
+                Some(format!("running pid={pid}").as_str()),
+            );
+        }
+        assert_eq!(
+            stub.called_names(),
+            vec!["wm-audio", "wm-tts", "wm-stt", "wm-dialog", "wmd"],
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_specs_records_pid_from_spawner() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(7_000);
+        let sup = Supervisor::new();
+        sup.start_specs(
+            &stub,
+            &[ChildSpec {
+                name: "wm-audio".into(),
+                exec: "wm-audio".into(),
+                args: vec![],
+            }],
+        )
+        .await?;
+        let view = sup.snapshot().await;
+        let audio = view
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .ok_or_else(|| anyhow::anyhow!("wm-audio absent"))?;
+        assert_eq!(audio.status, ChildStatus::Running);
+        assert_eq!(audio.child_pid, Some(7_001));
+        // The other four stay pending.
+        for other in view.children.iter().filter(|c| c.name != "wm-audio") {
+            assert_eq!(other.status, ChildStatus::Pending);
+            assert!(other.child_pid.is_none());
+        }
+        Ok(())
     }
 }

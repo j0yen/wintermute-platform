@@ -211,6 +211,7 @@ mod tests {
                 uptime_secs: 0,
                 restart_count: 0,
                 last_event: None,
+                child_pid: None,
             }],
         };
         // Smoke: should not panic. (Real assertion is the run-time check
