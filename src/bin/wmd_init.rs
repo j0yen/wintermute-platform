@@ -48,6 +48,7 @@ fn init_tracing() {
         .try_init();
 }
 
+#[allow(clippy::redundant_pub_crate)] // tokio::select! macro expansion false positive
 async fn run() -> anyhow::Result<()> {
     let env_path = resolve_bootstrap_env_path();
     info!(env_path = %env_path.display(), "resolving bootstrap config");

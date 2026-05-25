@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn response_status_roundtrip_with_pending_view() -> Result<(), serde_json::Error> {
         let view = SupervisorView::pending_for(&crate::canonical_children());
-        let resp = Response::Status { view: view.clone() };
+        let resp = Response::Status { view };
         let json = serde_json::to_string(&resp)?;
         let back: Response = serde_json::from_str(&json)?;
         assert_eq!(resp, back);

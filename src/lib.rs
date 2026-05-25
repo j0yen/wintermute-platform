@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// Canonical startup order for Fleet-1 children (PRD §2.3, intent-card hard_constraints).
+/// Canonical startup order for Fleet-1 children (PRD §2.3, intent-card `hard_constraints`).
 pub const CHILD_STARTUP_ORDER: &[&str] =
     &["wm-audio", "wm-tts", "wm-stt", "wm-dialog", "wmd"];
 
@@ -48,7 +48,7 @@ pub fn socket_path() -> PathBuf {
     socket_path_with(std::env::var_os("XDG_RUNTIME_DIR"))
 }
 
-/// Pure helper: build the socket path from an explicit XDG_RUNTIME_DIR value.
+/// Pure helper: build the socket path from an explicit `XDG_RUNTIME_DIR` value.
 #[must_use]
 pub fn socket_path_with(runtime_dir: Option<OsString>) -> PathBuf {
     let base = runtime_dir.map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
