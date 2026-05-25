@@ -1,0 +1,150 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "intent_slug": "wintermute-platform",
+  "prd_source": "/home/jsy/wintermute/autobuilder/PRD-wintermute-platform.md",
+  "root_motivation": "Children will crash and login screens defeat the point. wintermute needs a load-bearing scaffold that (1) autologins past the password prompt, (2) brings the five Fleet-1 voice services up in dependency order under one systemd-user target, (3) restarts crashed children within 1s, and (4) gives a `wm` CLI the household helper can use to mute, restart, or read logs without SSH.",
+  "user_persona": "Two operators. The primary user (non-literate, voice-only) never invokes anything in this PRD directly — she experiences it as 'the laptop just works'. The caregiver runs `wm status`, `wm mute`, `wm logs` from a terminal when something feels off. The supervisor itself (`wmd-init`) is launched by systemd, never by hand.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing",
+    "lower_is_better": false,
+    "harness_command": "cargo test --release --quiet -- --format=terse 2>&1 | awk '/test result:/ {gsub(\";\",\"\",$4); print $4}' | tail -1",
+    "target": 7
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "`systemctl --user start wintermute.target` brings every Fleet-1 child up in dependency order within 5 s.",
+      "test": "tests/acceptance_ac1.rs::supervisor_starts_children_in_order_within_5s — inject mock-child spawner; call supervisor::start(); assert children start in [wm-audio, wm-tts, wm-stt, wm-dialog, wmd] order and total elapsed <5s. Full systemd test is gated --ignored (requires installed units)."
+    },
+    {
+      "id": "AC2",
+      "level": "MUST",
+      "description": "Cold reboot (after bootstrap is done) to first greeting in <=15 s.",
+      "test": "tests/acceptance_ac2.rs::cold_boot_to_greeting_under_15s — measured at integration time on this laptop, not in CI; #[ignore]'d with a doc comment explaining the manual procedure (record systemd timestamps from wm-tts.service first audio frame)."
+    },
+    {
+      "id": "AC3",
+      "level": "MUST",
+      "description": "Killing any child (`pkill wm-audio`) restarts it within 1 s.",
+      "test": "tests/acceptance_ac3.rs::child_restart_within_1s — mock child = sleep 60 process; kill it via Pid; assert supervisor respawns within 1s wall-clock; assert restart count increments by 1."
+    },
+    {
+      "id": "AC4",
+      "level": "MUST",
+      "description": "`wm status` returns a complete table for all five children with correct uptime values.",
+      "test": "tests/acceptance_ac4.rs::wm_status_lists_all_children — over a unix socket fixture, supervisor reports a Vec<ChildStatus> of length 5 with names matching the supervised set; uptime monotonically increases between two reads ~100ms apart."
+    },
+    {
+      "id": "AC5",
+      "level": "MUST",
+      "description": "`wm mute` halts active TTS within 200 ms and suspends wake handling until `wm unmute`.",
+      "test": "tests/acceptance_ac5.rs::wm_mute_propagates_within_200ms — supervisor's mute command publishes 'state.mute=true' on agorabus; subscriber observes within 200ms; unmute clears it. Real TTS halt is observed in integration only."
+    },
+    {
+      "id": "AC6",
+      "level": "MUST",
+      "description": "`wm restart wm-stt` restarts only the named child; other children continue running uninterrupted.",
+      "test": "tests/acceptance_ac6.rs::wm_restart_named_child_only — capture all child PIDs before; issue restart for one child; assert that child's PID changed and others' PIDs are unchanged."
+    },
+    {
+      "id": "AC7",
+      "level": "MUST",
+      "description": "`wm logs wm-audio --tail 20` returns the last 20 stderr lines.",
+      "test": "tests/acceptance_ac7.rs::wm_logs_tail_returns_last_n — write 100 lines to ~/.local/state/wintermute/logs/wm-audio.log (tmpdir override); request tail 20; assert exact match against last 20 written lines."
+    },
+    {
+      "id": "AC8",
+      "level": "MUST",
+      "description": "After 5 restart-storm cycles within 60s, supervisor backs off and emits an `init.backoff` event on agorabus.",
+      "test": "tests/acceptance_ac8.rs::restart_storm_triggers_backoff — fake-child that exits immediately; supervisor restarts 5x within 60s; assert next restart waits >=30s AND assert published event topic='init.backoff' with payload.child=<name>."
+    },
+    {
+      "id": "AC9",
+      "level": "MUST",
+      "description": "Removing `00-bootstrap.env` causes `wmd-init` to exit cleanly with the log line 'no bootstrap config; halting' rather than crash-looping.",
+      "test": "tests/acceptance_ac9.rs::missing_env_exits_cleanly — point WM_BOOTSTRAP_ENV at a non-existent path; spawn wmd-init binary; assert exit code 0 (not crash) AND stderr contains the literal phrase 'no bootstrap config; halting' AND wall-clock <2s."
+    }
+  ],
+  "scope": [
+    "Rust binary `wmd-init`: long-lived supervisor of five child daemons (wm-audio, wm-tts, wm-stt, wm-dialog, wmd) in fixed startup order. Restart-within-1s, 5-in-60s backoff to 30s, 20-minute spoken-error escalation.",
+    "Rust binary `wm`: CLI with subcommands `status`, `mute`, `unmute`, `restart [child]`, `logs [child] [--tail N]`, `version`, `say <text>`. Talks to supervisor over Unix socket at $XDG_RUNTIME_DIR/wintermute/init.sock.",
+    "Supervisor implementation Option A (default): thin wrapper around `pevent` for child spawn + restart tracking. Falls back to Option B (tokio::process) if pevent integration is blocked.",
+    "JSON status protocol over the Unix socket; `wm status` formats human table OR `--json` raw.",
+    "Per-child log capture to ~/.local/state/wintermute/logs/<child>.log (rotated externally).",
+    "agorabus publishes for state changes (`state.mute`, `init.backoff`, `init.child_restart`)."
+  ],
+  "non_goals": [
+    "greetd autologin config — installed by the platform PRD's systemd/config drop-in (Phase 4 hooks tick later), not by this Rust crate.",
+    "Wintermute-session shell script and X11 startup — same: queued as platform's non-Rust hook portion.",
+    "Defining the systemd unit files themselves (wintermute.target, wmd-init.service) — installed via the hook portion of this PRD, not built by autobuilder.",
+    "Implementing the child daemons themselves — those are separate PRDs (wm-audio, wm-stt, wm-tts, wm-dialog, wmd).",
+    "Hibernate/suspend handling — Fleet 2 (per PRD §5).",
+    "Wayland session support — laptop is X11 (PRD §5)."
+  ],
+  "hard_constraints": {
+    "rust_edition": "2024",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": 25,
+    "msrv": "1.85",
+    "additional": {
+      "bin_names": "wmd-init,wm",
+      "supervisor_strategy": "Option A (pevent wrapper); fall back to Option B (tokio::process) only if pevent IPC turns out unsuitable",
+      "socket_path": "$XDG_RUNTIME_DIR/wintermute/init.sock",
+      "child_log_dir": "~/.local/state/wintermute/logs/",
+      "child_startup_order": "wm-audio,wm-tts,wm-stt,wm-dialog,wmd",
+      "restart_window_seconds": 60,
+      "restart_storm_threshold": 5,
+      "backoff_seconds": 30,
+      "escalation_minutes": 20,
+      "install_path": "~/.local/bin/ (per CLAUDE_SELF.md convention; resolves PRD §7 open question 2)"
+    }
+  },
+  "five_whys_trace": [
+    {
+      "why": 1,
+      "q": "Why does wintermute need a supervisor at all — can't systemd's Restart=always handle this?",
+      "a": "Systemd can restart, but the five children have inter-dependencies (audio first, tts before stt so the greeting plays, dialog before wmd) that are easier to express in one supervisor than five After= chains. A supervisor also owns the cross-child mute state and the restart-storm backoff policy without forcing every child unit to know about it."
+    },
+    {
+      "why": 2,
+      "q": "Why expose a `wm` CLI rather than just `systemctl --user`?",
+      "a": "Because the caregiver should be able to mute or restart from a terminal without learning systemd. `wm mute` is one word; `systemctl --user kill --signal=USR1 wmd-init.service` is not. The CLI also exposes status (uptime + restart count) that systemctl doesn't render compactly."
+    },
+    {
+      "why": 3,
+      "q": "Why prefer pevent (Option A) over a direct tokio::process supervisor (Option B)?",
+      "a": "Pevent already exists at ~/.local/bin/, is battle-tested for double-fork + structured state on this laptop, and shipping a thin wrapper means the supervisor reuses pevent's no-poll-wait semantics for free. Option B would duplicate that work for marginal dep-graph savings."
+    },
+    {
+      "why": 4,
+      "q": "Why does the supervisor need to exit cleanly on missing env file rather than crash-loop?",
+      "a": "A crash-looping wmd-init service triggers systemd's StartLimitBurst, which can take the whole wintermute.target offline. A clean exit with a single 'no bootstrap config; halting' log lets the operator (or wm-bootstrap re-run) see exactly what's wrong. Crash-looping in this case is misdiagnosis."
+    },
+    {
+      "why": 5,
+      "q": "Why publish `init.backoff` on agorabus rather than just log it?",
+      "a": "Because Claude (this agent) lives on the same bus and can subscribe — when a child keeps crashing, the next /build or /self-review tick can offer to investigate without the human having to forward a log file. Keeps the human in the loop only when they choose to be."
+    }
+  ],
+  "ambiguities_resolved": [
+    {
+      "question": "PRD §2.3 offers Option A (pevent wrapper) vs Option B (standalone tokio supervisor) and says /build can decide. Which?",
+      "resolution": "Option A. PRD recommends it, pevent is installed and tested locally, and it inherits structured-state + double-fork without duplicating work. Option B is the documented fallback if pevent's IPC surface proves unsuitable."
+    },
+    {
+      "question": "PRD §7 asks whether `wm` should install to ~/.local/bin/ or /usr/local/bin/.",
+      "resolution": "~/.local/bin/ — matches CLAUDE_SELF.md's 'local tools at ~/.local/bin/' convention and avoids a sudo step during /build install. /usr/local/bin/ is documented as the alternative for system-wide installs."
+    },
+    {
+      "question": "PRD §7 asks whether X server starts before wintermute.target or as a child of it.",
+      "resolution": "Deferred to the hook portion of this PRD (greetd / wintermute-session). The Rust supervisor neither starts nor depends on X; it only supervises the five wm-* children. The X decision lives in the systemd/greetd files queued for a later tick."
+    },
+    {
+      "question": "PRD AC2 (cold boot <=15s) and AC1 (target up within 5s) require real systemd integration — how should they be tested at unit/integration level?",
+      "resolution": "Both gated with #[ignore] and a comment describing manual procedure. Unit tests cover the supervisor's internal time accounting and dependency ordering against a mock-child spawner. End-to-end timing is verified by the operator during install."
+    }
+  ],
+  "created_at": "2026-05-25T02:43:00Z"
+}
