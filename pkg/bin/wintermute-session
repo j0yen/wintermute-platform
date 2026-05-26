@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# wintermute-session — caregiver-autologin entry point invoked by greetd.
+#
+# Responsibilities (per PRD-wintermute-platform §2.1):
+#   1. Ensure the user's systemd manager is reachable.
+#   2. Start an X11 session via bare xinit (Fleet 2's action layer needs
+#      a screen; Fleet 1 has no GUI dependency beyond the optional state
+#      indicator). If Xorg is not installed, fall back to a headless
+#      session and log a warning.
+#   3. systemctl --user start wintermute.target
+#   4. Block until wintermute.target exits, so logout == shutdown.
+#
+# This script lives at /usr/local/bin/wintermute-session in production.
+# It is intentionally small; the supervisor (wmd-init) owns child
+# lifecycle.
+
+set -uo pipefail
+
+log() { printf '[wintermute-session] %s\n' "$*" >&2; }
+
+ensure_user_systemd() {
+    if ! systemctl --user show-environment >/dev/null 2>&1; then
+        log "user systemd not reachable; attempting to start"
+        # `systemctl --user` will spawn the manager on first call inside
+        # an authorized PAM session. If we are not in one, dbus-run-session
+        # is the conventional escape hatch.
+        if command -v dbus-run-session >/dev/null 2>&1; then
+            exec dbus-run-session -- "$0" "$@"
+        fi
+    fi
+}
+
+start_xorg_if_available() {
+    if ! command -v Xorg >/dev/null 2>&1; then
+        log "Xorg not installed; running headless"
+        return 0
+    fi
+    if [ -n "${DISPLAY:-}" ]; then
+        log "DISPLAY=$DISPLAY already set; not starting Xorg"
+        return 0
+    fi
+    if ! command -v xinit >/dev/null 2>&1; then
+        log "Xorg present but xinit missing; running headless"
+        return 0
+    fi
+    log "starting bare Xorg via xinit on :0"
+    xinit /usr/bin/true -- :0 vt$XDG_VTNR -keeptty >/dev/null 2>&1 &
+    XORG_PID=$!
+    export DISPLAY=:0
+    sleep 1
+    if ! kill -0 "$XORG_PID" 2>/dev/null; then
+        log "Xorg exited immediately; continuing headless"
+        unset DISPLAY
+    fi
+}
+
+start_target() {
+    log "starting wintermute.target"
+    if ! systemctl --user start wintermute.target; then
+        log "ERROR: systemctl --user start wintermute.target failed"
+        return 1
+    fi
+}
+
+wait_for_target_stop() {
+    log "blocking on wintermute.target state"
+    while systemctl --user is-active --quiet wintermute.target; do
+        sleep 5
+    done
+    log "wintermute.target is no longer active; session ending"
+}
+
+main() {
+    ensure_user_systemd "$@"
+    start_xorg_if_available
+    start_target || exit 1
+    wait_for_target_stop
+}
+
+main "$@"

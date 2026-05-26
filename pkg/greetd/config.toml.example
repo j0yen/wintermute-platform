@@ -1,0 +1,18 @@
+# greetd drop-in for wintermute autologin.
+#
+# Install to /etc/greetd/config.toml (or merge into an existing config).
+# After installing, `systemctl enable --now greetd`.
+#
+# `wintermute-session` is the helper shell script installed by this
+# package to /usr/local/bin/wintermute-session.
+
+[terminal]
+vt = 1
+
+[default_session]
+command = "agreety --cmd wintermute-session"
+user = "wintermute"
+
+[initial_session]
+command = "wintermute-session"
+user = "wintermute"

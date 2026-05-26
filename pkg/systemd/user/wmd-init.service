@@ -1,0 +1,17 @@
+[Unit]
+Description=wintermute supervisor (wmd-init)
+Documentation=https://github.com/j0yen/wintermute-platform
+After=pipewire.service pipewire-pulse.service
+ConditionPathExists=/etc/wintermute/conf.d/00-bootstrap.env
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/wmd-init
+Restart=always
+RestartSec=2
+EnvironmentFile=/etc/wintermute/conf.d/00-bootstrap.env
+NotifyAccess=main
+TimeoutStartSec=30
+
+[Install]
+WantedBy=wintermute.target

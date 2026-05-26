@@ -1,0 +1,5 @@
+[Unit]
+Description=wintermute voice AI laptop
+Documentation=https://github.com/j0yen/wintermute-platform
+Wants=wmd-init.service
+After=wmd-init.service
