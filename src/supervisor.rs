@@ -1,27 +1,27 @@
 //! In-memory supervisor state + UDS server.
 //!
-//! Iter-6 surface: iter-5 (`start_all` + `observe_exits`) plus a
-//! `restart_exited` pass that consults a per-child [`RestartTracker`],
-//! restarts `Exited` children whose tracker still permits it, and
-//! flips slots to [`ChildStatus::Backoff`] once the rolling-window
-//! threshold is hit. The actual delay scheduling (sleep between
-//! attempts) is the binary's job; this pass is single-shot and pure
-//! state-machine.
+//! Iter-7 surface: iter-6 (`start_all` + `observe_exits` +
+//! `restart_exited`) plus `clear_expired_backoffs`, which flips
+//! `Backoff` slots back to `Exited` once the per-child wake-up
+//! timestamp has passed. The wmd-init binary loop now owns both the
+//! [`RestartTracker`] map and the `backoff_until` schedule, and ties
+//! them together each tick: clear → observe → restart → record.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, error, info, warn};
 
 use crate::protocol::{ChildStatus, Request, Response, SupervisorView};
 use crate::spawn::Spawner;
-use crate::{ChildSpec, RestartTracker, canonical_children};
+use crate::{BACKOFF_SECS, ChildSpec, RestartTracker, canonical_children};
 
 /// Result of one [`Supervisor::restart_exited`] decision for a child.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +236,118 @@ impl Supervisor {
             }
         }
         Ok(outcomes)
+    }
+
+    /// Flip [`ChildStatus::Backoff`] slots back to [`ChildStatus::Exited`]
+    /// once their entry in `due` has elapsed (`now >= due[name]`).
+    /// Returns the names that just transitioned, in canonical order.
+    /// Slots not in `Backoff` and slots without a `due` entry are skipped.
+    pub async fn clear_expired_backoffs(
+        &self,
+        due: &BTreeMap<String, Instant>,
+        now: Instant,
+    ) -> Vec<String> {
+        let mut transitions = Vec::new();
+        {
+            let mut g = self.state.lock().await;
+            for slot in &mut g.children {
+                if slot.status != ChildStatus::Backoff {
+                    continue;
+                }
+                if let Some(&until) = due.get(&slot.name) {
+                    if now >= until {
+                        slot.status = ChildStatus::Exited;
+                        slot.last_event = Some("backoff expired; retrying".into());
+                        transitions.push(slot.name.clone());
+                    }
+                }
+            }
+        }
+        transitions
+    }
+
+    /// One iteration of the supervisor loop. The order is load-bearing:
+    /// clearing backoffs first means a slot whose process is still gone
+    /// can be restarted in the same tick. Mutates `trackers` and
+    /// `backoff_until` in place so the caller can hand both back next
+    /// tick. Failures inside individual phases are logged and surfaced
+    /// via tracing, never returned — keeping the loop alive matches the
+    /// PRD's "keep trying" intent.
+    pub async fn observer_pass<S: Spawner + ?Sized>(
+        &self,
+        spawner: &S,
+        trackers: &mut BTreeMap<String, RestartTracker>,
+        backoff_until: &mut BTreeMap<String, Instant>,
+        now: Instant,
+    ) {
+        let cleared = self.clear_expired_backoffs(backoff_until, now).await;
+        for name in cleared {
+            backoff_until.remove(&name);
+            info!(child = %name, "backoff expired; retrying");
+        }
+        match self.observe_exits(spawner).await {
+            Ok(transitions) => {
+                for name in transitions {
+                    info!(child = %name, "child exited");
+                }
+            }
+            Err(e) => warn!(error = %e, "observe_exits failed"),
+        }
+        match self.restart_exited(spawner, trackers, now).await {
+            Ok(outcomes) => {
+                for outcome in outcomes {
+                    match outcome {
+                        RestartOutcome::Restarted {
+                            name,
+                            child_pid,
+                            restart_count,
+                        } => {
+                            info!(
+                                child = %name,
+                                pid = child_pid,
+                                count = restart_count,
+                                "child restarted",
+                            );
+                        }
+                        RestartOutcome::EnteredBackoff {
+                            name,
+                            restarts_in_window,
+                        } => {
+                            warn!(
+                                child = %name,
+                                restarts = restarts_in_window,
+                                backoff_secs = BACKOFF_SECS,
+                                "entered backoff",
+                            );
+                            backoff_until
+                                .insert(name, now + Duration::from_secs(BACKOFF_SECS));
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "restart_exited failed"),
+        }
+    }
+
+    /// Run the supervisor loop forever at `interval`. Owns the
+    /// `RestartTracker` map and the `backoff_until` schedule. Designed
+    /// to be spawned via `tokio::spawn` and aborted on shutdown by the
+    /// caller.
+    pub async fn run_observer_loop<S: Spawner + ?Sized>(
+        self,
+        spawner: &S,
+        interval: Duration,
+    ) {
+        let mut trackers: BTreeMap<String, RestartTracker> = BTreeMap::new();
+        let mut backoff_until: BTreeMap<String, Instant> = BTreeMap::new();
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+            self.observer_pass(spawner, &mut trackers, &mut backoff_until, now)
+                .await;
+        }
     }
 
     /// Bind `socket_path` and serve forever. Parent directory is
@@ -672,6 +784,313 @@ mod tests {
             assert_eq!(other.status, ChildStatus::Pending);
             assert!(other.child_pid.is_none());
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_expired_backoffs_flips_due_slots_to_exited() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(200_000);
+        let sup = Supervisor::new();
+        sup.start_specs(
+            &stub,
+            &[ChildSpec {
+                name: "wm-audio".into(),
+                exec: "wm-audio".into(),
+                args: vec![],
+            }],
+        )
+        .await?;
+        // Saturate the tracker so restart_exited flips to Backoff on next exit.
+        let pid = sup
+            .snapshot()
+            .await
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .and_then(|c| c.child_pid)
+            .ok_or_else(|| anyhow::anyhow!("audio pid missing"))?;
+        stub.mark_exited(pid);
+        let _ = sup.observe_exits(&stub).await?;
+        let mut trackers: BTreeMap<String, RestartTracker> = BTreeMap::new();
+        // Pre-fill window so the first restart attempt trips backoff.
+        let t = trackers.entry("wm-audio".into()).or_default();
+        let base = Instant::now();
+        for i in 0..crate::RESTART_STORM_THRESHOLD {
+            let _ = t.record(base + std::time::Duration::from_millis(u64::from(i)));
+        }
+        let outcomes = sup
+            .restart_exited(&stub, &mut trackers, base)
+            .await?;
+        assert!(matches!(
+            outcomes.as_slice(),
+            [RestartOutcome::EnteredBackoff { .. }]
+        ));
+
+        let mut due: BTreeMap<String, Instant> = BTreeMap::new();
+        let until = base + std::time::Duration::from_secs(crate::BACKOFF_SECS);
+        due.insert("wm-audio".into(), until);
+
+        // Before the deadline → no transition.
+        let early = sup.clear_expired_backoffs(&due, base).await;
+        assert!(early.is_empty(), "premature flip: {early:?}");
+        let v = sup.snapshot().await;
+        assert_eq!(
+            v.children
+                .iter()
+                .find(|c| c.name == "wm-audio")
+                .map(|c| c.status),
+            Some(ChildStatus::Backoff),
+        );
+
+        // Past the deadline → flips Backoff → Exited.
+        let after = until + std::time::Duration::from_millis(1);
+        let cleared = sup.clear_expired_backoffs(&due, after).await;
+        assert_eq!(cleared, vec!["wm-audio".to_string()]);
+        let v = sup.snapshot().await;
+        let slot = v
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .ok_or_else(|| anyhow::anyhow!("audio missing"))?;
+        assert_eq!(slot.status, ChildStatus::Exited);
+        assert_eq!(
+            slot.last_event.as_deref(),
+            Some("backoff expired; retrying"),
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_expired_backoffs_skips_non_backoff_slots() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(210_000);
+        let sup = Supervisor::new();
+        sup.start_all(&stub).await?;
+        let now = Instant::now();
+        let mut due: BTreeMap<String, Instant> = BTreeMap::new();
+        // Mark every child due in the past — but none are in Backoff.
+        for name in ["wm-audio", "wm-tts", "wm-stt", "wm-dialog", "wmd"] {
+            due.insert(name.into(), now - std::time::Duration::from_secs(10));
+        }
+        let cleared = sup.clear_expired_backoffs(&due, now).await;
+        assert!(cleared.is_empty(), "flipped a non-backoff slot: {cleared:?}");
+        let v = sup.snapshot().await;
+        assert!(v.children.iter().all(|c| c.status == ChildStatus::Running));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observer_pass_restarts_a_freshly_crashed_child() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(300_000);
+        let sup = Supervisor::new();
+        sup.start_specs(
+            &stub,
+            &[ChildSpec {
+                name: "wm-audio".into(),
+                exec: "wm-audio".into(),
+                args: vec![],
+            }],
+        )
+        .await?;
+        let pid = sup
+            .snapshot()
+            .await
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .and_then(|c| c.child_pid)
+            .ok_or_else(|| anyhow::anyhow!("audio pid missing"))?;
+        stub.mark_exited(pid);
+        let mut trackers: BTreeMap<String, RestartTracker> = BTreeMap::new();
+        let mut backoff_until: BTreeMap<String, Instant> = BTreeMap::new();
+        sup.observer_pass(&stub, &mut trackers, &mut backoff_until, Instant::now())
+            .await;
+        let v = sup.snapshot().await;
+        let slot = v
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .ok_or_else(|| anyhow::anyhow!("audio absent"))?;
+        assert_eq!(slot.status, ChildStatus::Running);
+        assert_eq!(slot.restart_count, 1);
+        assert!(backoff_until.is_empty());
+        assert_eq!(
+            trackers
+                .get("wm-audio")
+                .map(super::RestartTracker::restarts_in_window),
+            Some(1),
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observer_pass_records_backoff_when_storm_trips() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(310_000);
+        let sup = Supervisor::new();
+        sup.start_specs(
+            &stub,
+            &[ChildSpec {
+                name: "wm-audio".into(),
+                exec: "wm-audio".into(),
+                args: vec![],
+            }],
+        )
+        .await?;
+        let mut trackers: BTreeMap<String, RestartTracker> = BTreeMap::new();
+        let mut backoff_until: BTreeMap<String, Instant> = BTreeMap::new();
+        // Crash → restart cycle, repeated until the window saturates.
+        // The first RESTART_STORM_THRESHOLD - 1 ticks restart cleanly;
+        // the threshold-th flips to backoff and records a due time.
+        let base = Instant::now();
+        for i in 0..crate::RESTART_STORM_THRESHOLD {
+            // Whatever PID is currently in the slot, mark it gone.
+            let pid = sup
+                .snapshot()
+                .await
+                .children
+                .iter()
+                .find(|c| c.name == "wm-audio")
+                .and_then(|c| c.child_pid)
+                .ok_or_else(|| anyhow::anyhow!("audio pid missing at iter {i}"))?;
+            stub.mark_exited(pid);
+            sup.observer_pass(
+                &stub,
+                &mut trackers,
+                &mut backoff_until,
+                base + Duration::from_millis(u64::from(i) * 10),
+            )
+            .await;
+        }
+        let v = sup.snapshot().await;
+        let slot = v
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .ok_or_else(|| anyhow::anyhow!("audio absent"))?;
+        assert_eq!(slot.status, ChildStatus::Backoff);
+        let until = backoff_until
+            .get("wm-audio")
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("backoff_until missing entry"))?;
+        // The recorded due time is ~BACKOFF_SECS from the last tick.
+        let last_tick = base
+            + Duration::from_millis(
+                u64::from(crate::RESTART_STORM_THRESHOLD.saturating_sub(1)) * 10,
+            );
+        let expected = last_tick + Duration::from_secs(BACKOFF_SECS);
+        assert_eq!(until, expected);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn observer_pass_clears_backoff_then_retries_in_a_later_tick() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(320_000);
+        let sup = Supervisor::new();
+        sup.start_specs(
+            &stub,
+            &[ChildSpec {
+                name: "wm-audio".into(),
+                exec: "wm-audio".into(),
+                args: vec![],
+            }],
+        )
+        .await?;
+        let mut trackers: BTreeMap<String, RestartTracker> = BTreeMap::new();
+        let mut backoff_until: BTreeMap<String, Instant> = BTreeMap::new();
+        let base = Instant::now();
+        // Saturate the window so the next exit trips backoff.
+        for i in 0..crate::RESTART_STORM_THRESHOLD {
+            let pid = sup
+                .snapshot()
+                .await
+                .children
+                .iter()
+                .find(|c| c.name == "wm-audio")
+                .and_then(|c| c.child_pid)
+                .ok_or_else(|| anyhow::anyhow!("audio pid missing at iter {i}"))?;
+            stub.mark_exited(pid);
+            sup.observer_pass(
+                &stub,
+                &mut trackers,
+                &mut backoff_until,
+                base + Duration::from_millis(u64::from(i) * 10),
+            )
+            .await;
+        }
+        assert_eq!(
+            sup.snapshot()
+                .await
+                .children
+                .iter()
+                .find(|c| c.name == "wm-audio")
+                .map(|c| c.status),
+            Some(ChildStatus::Backoff),
+        );
+        // Tick well past both the recorded due time AND the rolling
+        // window, so clear_expired_backoffs flips Backoff → Exited and
+        // restart_exited sees an empty history (no longer saturated) and
+        // relaunches the child cleanly in the same pass.
+        let later = base
+            + Duration::from_secs(crate::RESTART_WINDOW_SECS + BACKOFF_SECS + 1);
+        sup.observer_pass(&stub, &mut trackers, &mut backoff_until, later)
+            .await;
+        let v = sup.snapshot().await;
+        let slot = v
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .ok_or_else(|| anyhow::anyhow!("audio absent"))?;
+        assert_eq!(slot.status, ChildStatus::Running);
+        assert!(
+            !backoff_until.contains_key("wm-audio"),
+            "backoff_until should be cleared after successful retry",
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_expired_backoffs_ignores_slots_without_due_entry() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(220_000);
+        let sup = Supervisor::new();
+        sup.start_specs(
+            &stub,
+            &[ChildSpec {
+                name: "wm-audio".into(),
+                exec: "wm-audio".into(),
+                args: vec![],
+            }],
+        )
+        .await?;
+        // Force the slot to Backoff via the tracker-saturation path.
+        let pid = sup
+            .snapshot()
+            .await
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .and_then(|c| c.child_pid)
+            .ok_or_else(|| anyhow::anyhow!("audio pid missing"))?;
+        stub.mark_exited(pid);
+        let _ = sup.observe_exits(&stub).await?;
+        let mut trackers: BTreeMap<String, RestartTracker> = BTreeMap::new();
+        let base = Instant::now();
+        let t = trackers.entry("wm-audio".into()).or_default();
+        for i in 0..crate::RESTART_STORM_THRESHOLD {
+            let _ = t.record(base + std::time::Duration::from_millis(u64::from(i)));
+        }
+        let _ = sup.restart_exited(&stub, &mut trackers, base).await?;
+        // Empty `due` map → no transition even with elapsed time.
+        let due: BTreeMap<String, Instant> = BTreeMap::new();
+        let way_later = base + std::time::Duration::from_secs(crate::BACKOFF_SECS * 10);
+        let cleared = sup.clear_expired_backoffs(&due, way_later).await;
+        assert!(cleared.is_empty());
+        let v = sup.snapshot().await;
+        assert_eq!(
+            v.children
+                .iter()
+                .find(|c| c.name == "wm-audio")
+                .map(|c| c.status),
+            Some(ChildStatus::Backoff),
+        );
         Ok(())
     }
 }

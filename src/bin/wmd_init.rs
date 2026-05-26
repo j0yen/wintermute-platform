@@ -1,10 +1,12 @@
 //! `wmd-init` — wintermute supervisor entry point.
 //!
-//! Iter-5 scope: load bootstrap env (or halt per AC9), bind the UDS
-//! control plane, and — when `--spawn` is supplied — start the
-//! canonical five children via `PeventSpawner` and run a 1 s
-//! observation loop that flips `Running → Exited` on PID loss.
-//! Restart-on-exit policy lives in iter-6.
+//! Iter-7 scope: iter-5 (observation loop) + iter-6 (`restart_exited`
+//! primitive) wired together. Each 1 s tick the binary now (1) flips
+//! any backoff slots whose wake-up has elapsed back to `Exited`,
+//! (2) probes Running children for exits, (3) restarts Exited slots
+//! and schedules a `BACKOFF_SECS` wake-up for any that tripped the
+//! storm threshold. The `RestartTracker` map + `backoff_until`
+//! schedule live entirely inside the spawned observer task.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -20,7 +22,7 @@ use wintermute_platform::{
     socket_path,
 };
 
-/// Interval between exit-observation passes (PRD §2.3 calls for 1 s).
+/// Interval between supervisor passes (PRD §2.3 calls for 1 s).
 const OBSERVE_INTERVAL: Duration = Duration::from_millis(1_000);
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -113,20 +115,7 @@ async fn run(cli: CliArgs) -> anyhow::Result<()> {
         }
         let sup = sup.clone();
         Some(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(OBSERVE_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                match sup.observe_exits(&spawner).await {
-                    Ok(transitions) if !transitions.is_empty() => {
-                        for name in transitions {
-                            info!(child = %name, "child exited");
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!(error = %e, "observe_exits failed"),
-                }
-            }
+            sup.run_observer_loop(&spawner, OBSERVE_INTERVAL).await;
         }))
     } else {
         None
