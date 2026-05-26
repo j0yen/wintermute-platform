@@ -1,18 +1,17 @@
 //! In-memory supervisor state + UDS server.
 //!
-//! Iter-5 surface: everything iter-4 had (UDS server, `start_all` /
-//! `start_specs` against a pluggable [`Spawner`]) plus an
-//! `observe_exits` pass that asks the spawner about each `Running`
-//! child and transitions `Running → Exited` on PID loss. `wmd-init`
-//! now opt-ins via the `--spawn` flag to call `start_all` and the
-//! observer loop; without it the binary still serves a pending view
-//! (preserves AC9).
-//!
-//! Restart-on-exit policy lives in iter-6 (`RestartTracker`
-//! integration); this iter only detects the transition.
+//! Iter-6 surface: iter-5 (`start_all` + `observe_exits`) plus a
+//! `restart_exited` pass that consults a per-child [`RestartTracker`],
+//! restarts `Exited` children whose tracker still permits it, and
+//! flips slots to [`ChildStatus::Backoff`] once the rolling-window
+//! threshold is hit. The actual delay scheduling (sleep between
+//! attempts) is the binary's job; this pass is single-shot and pure
+//! state-machine.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22,7 +21,28 @@ use tracing::{debug, error, info};
 
 use crate::protocol::{ChildStatus, Request, Response, SupervisorView};
 use crate::spawn::Spawner;
-use crate::{ChildSpec, canonical_children};
+use crate::{ChildSpec, RestartTracker, canonical_children};
+
+/// Result of one [`Supervisor::restart_exited`] decision for a child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartOutcome {
+    /// Child was relaunched; carries the new PID and updated restart count.
+    Restarted {
+        /// Child name.
+        name: String,
+        /// New PID from the spawner.
+        child_pid: u32,
+        /// Total restarts since supervisor start, after this attempt.
+        restart_count: u32,
+    },
+    /// Child tripped the storm threshold; slot flipped to `Backoff`.
+    EnteredBackoff {
+        /// Child name.
+        name: String,
+        /// Number of restarts inside the rolling window.
+        restarts_in_window: usize,
+    },
+}
 
 /// In-memory snapshot + UDS server.
 #[derive(Debug, Clone)]
@@ -133,6 +153,89 @@ impl Supervisor {
             }
         }
         Ok(transitions)
+    }
+
+    /// Restart children currently in [`ChildStatus::Exited`] under the
+    /// guidance of `trackers`. For each exited child, `record(now)` is
+    /// called on its tracker; a `ZERO` delay means immediate restart
+    /// (slot flips `Exited → Starting → Running` with a fresh PID),
+    /// and a non-zero delay means the rolling window is saturated and
+    /// the slot flips `Exited → Backoff`. Children without a tracker
+    /// entry get one created with `RestartTracker::default()`.
+    /// Returns one [`RestartOutcome`] per Exited child encountered, in
+    /// canonical order.
+    ///
+    /// Other lifecycle phases (Pending/Starting/Running/Backoff/Halted)
+    /// are skipped. The actual `BACKOFF_SECS` sleep is the binary's
+    /// responsibility — this pass is single-shot.
+    ///
+    /// # Errors
+    /// Surfaces the first `Spawner::start` error encountered.
+    pub async fn restart_exited<S: Spawner + ?Sized>(
+        &self,
+        spawner: &S,
+        trackers: &mut BTreeMap<String, RestartTracker>,
+        now: Instant,
+    ) -> Result<Vec<RestartOutcome>> {
+        let exited: Vec<(String, String)> = {
+            let g = self.state.lock().await;
+            g.children
+                .iter()
+                .filter(|c| c.status == ChildStatus::Exited)
+                .map(|c| (c.name.clone(), c.name.clone()))
+                .collect()
+        };
+        let mut outcomes = Vec::with_capacity(exited.len());
+        for (name, exec_name) in exited {
+            let tracker = trackers.entry(name.clone()).or_default();
+            let delay = tracker.record(now);
+            let restarts_in_window = tracker.restarts_in_window();
+            if delay.is_zero() {
+                let started = spawner
+                    .start(&ChildSpec {
+                        name: name.clone(),
+                        exec: exec_name,
+                        args: Vec::new(),
+                    })
+                    .with_context(|| format!("restart child {name}"))?;
+                let updated_count = {
+                    let mut g = self.state.lock().await;
+                    g.children
+                        .iter_mut()
+                        .find(|c| c.name == name)
+                        .map_or(0, |slot| {
+                            slot.status = ChildStatus::Running;
+                            slot.child_pid = Some(started.child_pid);
+                            slot.restart_count = slot.restart_count.saturating_add(1);
+                            slot.last_event = Some(format!(
+                                "restarted pid={} (#{})",
+                                started.child_pid, slot.restart_count
+                            ));
+                            slot.restart_count
+                        })
+                };
+                outcomes.push(RestartOutcome::Restarted {
+                    name,
+                    child_pid: started.child_pid,
+                    restart_count: updated_count,
+                });
+            } else {
+                {
+                    let mut g = self.state.lock().await;
+                    if let Some(slot) = g.children.iter_mut().find(|c| c.name == name) {
+                        slot.status = ChildStatus::Backoff;
+                        slot.last_event = Some(format!(
+                            "backoff ({restarts_in_window} restarts in window)"
+                        ));
+                    }
+                }
+                outcomes.push(RestartOutcome::EnteredBackoff {
+                    name,
+                    restarts_in_window,
+                });
+            }
+        }
+        Ok(outcomes)
     }
 
     /// Bind `socket_path` and serve forever. Parent directory is
@@ -360,6 +463,185 @@ mod tests {
         let view = sup.snapshot().await;
         for c in &view.children {
             assert_eq!(c.status, ChildStatus::Pending);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_exited_relaunches_exited_child_and_increments_count() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(80_000);
+        let sup = Supervisor::new();
+        sup.start_all(&stub).await?;
+        let pid_tts = sup
+            .snapshot()
+            .await
+            .children
+            .iter()
+            .find(|c| c.name == "wm-tts")
+            .and_then(|c| c.child_pid)
+            .ok_or_else(|| anyhow::anyhow!("wm-tts missing pid"))?;
+        stub.mark_exited(pid_tts);
+        let _ = sup.observe_exits(&stub).await?;
+
+        let mut trackers: BTreeMap<String, RestartTracker> = BTreeMap::new();
+        let outcomes = sup
+            .restart_exited(&stub, &mut trackers, Instant::now())
+            .await?;
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        match &outcomes[0] {
+            RestartOutcome::Restarted {
+                name,
+                child_pid,
+                restart_count,
+            } => {
+                assert_eq!(name, "wm-tts");
+                assert_ne!(*child_pid, pid_tts, "expected fresh PID");
+                assert_eq!(*restart_count, 1);
+            }
+            other => panic!("expected Restarted, got {other:?}"),
+        }
+
+        let view = sup.snapshot().await;
+        let tts = view
+            .children
+            .iter()
+            .find(|c| c.name == "wm-tts")
+            .ok_or_else(|| anyhow::anyhow!("wm-tts absent"))?;
+        assert_eq!(tts.status, ChildStatus::Running);
+        assert_eq!(tts.restart_count, 1);
+        assert_ne!(tts.child_pid, Some(pid_tts));
+        assert!(tts
+            .last_event
+            .as_deref()
+            .is_some_and(|s| s.starts_with("restarted pid=") && s.contains("(#1)")));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_exited_flips_to_backoff_on_storm_threshold() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(90_000);
+        let sup = Supervisor::new();
+        sup.start_specs(
+            &stub,
+            &[ChildSpec {
+                name: "wm-audio".into(),
+                exec: "wm-audio".into(),
+                args: vec![],
+            }],
+        )
+        .await?;
+        let mut trackers: BTreeMap<String, RestartTracker> = BTreeMap::new();
+        let base = Instant::now();
+        // Five back-to-back crash + restart cycles inside the window.
+        for i in 0..5 {
+            let pid = sup
+                .snapshot()
+                .await
+                .children
+                .iter()
+                .find(|c| c.name == "wm-audio")
+                .and_then(|c| c.child_pid)
+                .ok_or_else(|| anyhow::anyhow!("wm-audio missing pid on cycle {i}"))?;
+            stub.mark_exited(pid);
+            let _ = sup.observe_exits(&stub).await?;
+            let outcomes = sup
+                .restart_exited(
+                    &stub,
+                    &mut trackers,
+                    base + std::time::Duration::from_millis(i * 100),
+                )
+                .await?;
+            assert_eq!(outcomes.len(), 1, "cycle {i}: {outcomes:?}");
+            if i < 4 {
+                assert!(
+                    matches!(&outcomes[0], RestartOutcome::Restarted { .. }),
+                    "cycle {i} expected restart, got {:?}",
+                    outcomes[0]
+                );
+            } else {
+                match &outcomes[0] {
+                    RestartOutcome::EnteredBackoff {
+                        name,
+                        restarts_in_window,
+                    } => {
+                        assert_eq!(name, "wm-audio");
+                        assert_eq!(*restarts_in_window, 5);
+                    }
+                    other => panic!("cycle 4 expected EnteredBackoff, got {other:?}"),
+                }
+            }
+        }
+        let view = sup.snapshot().await;
+        let audio = view
+            .children
+            .iter()
+            .find(|c| c.name == "wm-audio")
+            .ok_or_else(|| anyhow::anyhow!("wm-audio absent"))?;
+        assert_eq!(audio.status, ChildStatus::Backoff);
+        assert_eq!(audio.restart_count, 4, "4 successful restarts before storm");
+        assert!(audio
+            .last_event
+            .as_deref()
+            .is_some_and(|s| s.starts_with("backoff (5 restarts in window)")));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_exited_is_noop_when_nothing_exited() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(100_000);
+        let sup = Supervisor::new();
+        sup.start_all(&stub).await?;
+        let mut trackers: BTreeMap<String, RestartTracker> = BTreeMap::new();
+        let outcomes = sup
+            .restart_exited(&stub, &mut trackers, Instant::now())
+            .await?;
+        assert!(outcomes.is_empty());
+        assert!(trackers.is_empty(), "tracker map untouched when no work");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_exited_handles_each_child_with_its_own_tracker() -> Result<()> {
+        let stub = crate::spawn::testing::StubSpawner::new(110_000);
+        let sup = Supervisor::new();
+        sup.start_all(&stub).await?;
+        // Crash two of the five.
+        let pids: Vec<(String, u32)> = sup
+            .snapshot()
+            .await
+            .children
+            .iter()
+            .filter(|c| c.name == "wm-stt" || c.name == "wm-dialog")
+            .filter_map(|c| c.child_pid.map(|p| (c.name.clone(), p)))
+            .collect();
+        assert_eq!(pids.len(), 2);
+        for (_, pid) in &pids {
+            stub.mark_exited(*pid);
+        }
+        let _ = sup.observe_exits(&stub).await?;
+
+        let mut trackers: BTreeMap<String, RestartTracker> = BTreeMap::new();
+        let outcomes = sup
+            .restart_exited(&stub, &mut trackers, Instant::now())
+            .await?;
+        assert_eq!(outcomes.len(), 2);
+        // Each child should have exactly one tracker entry with one restart.
+        assert_eq!(trackers.len(), 2);
+        for name in ["wm-stt", "wm-dialog"] {
+            let t = trackers
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("no tracker for {name}"))?;
+            assert_eq!(t.restarts_in_window(), 1, "{name}");
+        }
+        let view = sup.snapshot().await;
+        for name in ["wm-stt", "wm-dialog"] {
+            let c = view
+                .children
+                .iter()
+                .find(|c| c.name == name)
+                .ok_or_else(|| anyhow::anyhow!("{name} absent"))?;
+            assert_eq!(c.status, ChildStatus::Running);
+            assert_eq!(c.restart_count, 1);
         }
         Ok(())
     }
