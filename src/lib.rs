@@ -73,6 +73,47 @@ pub fn child_log_path_with(home: Option<OsString>, child: &str) -> PathBuf {
         .join(format!("{child}.log"))
 }
 
+/// Read the last `tail` lines of the per-child stderr log.
+///
+/// Missing log file → `Ok(vec![])` (a child that hasn't logged anything yet
+/// is a normal state, not an error). Any other I/O error surfaces.
+///
+/// Lines are returned in original file order (oldest of the tail first).
+/// Trailing CR/LF stripped per line.
+///
+/// # Errors
+/// Surfaces I/O errors other than `NotFound` from reading the log file.
+pub fn tail_child_log(child: &str, tail: usize) -> std::io::Result<Vec<String>> {
+    tail_child_log_with(std::env::var_os("HOME"), child, tail)
+}
+
+/// Pure variant of [`tail_child_log`] taking an explicit HOME for tests.
+///
+/// # Errors
+/// Surfaces I/O errors other than `NotFound`.
+pub fn tail_child_log_with(
+    home: Option<OsString>,
+    child: &str,
+    tail: usize,
+) -> std::io::Result<Vec<String>> {
+    let path = child_log_path_with(home, child);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            if tail == 0 {
+                return Ok(Vec::new());
+            }
+            let mut all: Vec<String> = text.lines().map(str::to_owned).collect();
+            if all.len() > tail {
+                let drop = all.len() - tail;
+                all.drain(..drop);
+            }
+            Ok(all)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Resolve which bootstrap env path to use: `WM_BOOTSTRAP_ENV` override, else default.
 #[must_use]
 pub fn resolve_bootstrap_env_path() -> PathBuf {
@@ -307,6 +348,47 @@ mod tests {
         let json = serde_json::to_string(&spec)?;
         let back: ChildSpec = serde_json::from_str(&json)?;
         assert_eq!(spec, back);
+        Ok(())
+    }
+
+    #[test]
+    fn tail_child_log_missing_file_returns_empty() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let lines = tail_child_log_with(Some(dir.path().as_os_str().to_owned()), "wm-audio", 20)?;
+        assert!(lines.is_empty());
+        Ok(())
+    }
+
+    fn write_child_log(home: &Path, child: &str, contents: &str) -> std::io::Result<()> {
+        let log_dir = home.join(".local/state/wintermute/logs");
+        std::fs::create_dir_all(&log_dir)?;
+        std::fs::write(log_dir.join(format!("{child}.log")), contents)
+    }
+
+    #[test]
+    fn tail_child_log_returns_last_n_lines_in_order() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        write_child_log(dir.path(), "wm-audio", "a\nb\nc\nd\ne\n")?;
+        let lines = tail_child_log_with(Some(dir.path().as_os_str().to_owned()), "wm-audio", 3)?;
+        assert_eq!(lines, vec!["c".to_string(), "d".into(), "e".into()]);
+        Ok(())
+    }
+
+    #[test]
+    fn tail_child_log_tail_larger_than_file_returns_all() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        write_child_log(dir.path(), "wm-stt", "one\ntwo\n")?;
+        let lines = tail_child_log_with(Some(dir.path().as_os_str().to_owned()), "wm-stt", 20)?;
+        assert_eq!(lines, vec!["one".to_string(), "two".into()]);
+        Ok(())
+    }
+
+    #[test]
+    fn tail_child_log_zero_returns_empty() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        write_child_log(dir.path(), "wm-tts", "x\ny\n")?;
+        let lines = tail_child_log_with(Some(dir.path().as_os_str().to_owned()), "wm-tts", 0)?;
+        assert!(lines.is_empty());
         Ok(())
     }
 }

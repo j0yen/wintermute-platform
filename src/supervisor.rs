@@ -422,15 +422,22 @@ async fn dispatch(req: Request, state: &Mutex<SupervisorView>) -> Response {
             let view = state.lock().await.clone();
             Response::Status { view }
         }
-        Request::Mute => Response::NotImplemented { op: "mute".into() },
-        Request::Unmute => Response::NotImplemented {
-            op: "unmute".into(),
-        },
+        Request::Mute => {
+            state.lock().await.muted = true;
+            Response::Ack
+        }
+        Request::Unmute => {
+            state.lock().await.muted = false;
+            Response::Ack
+        }
         Request::Restart { .. } => Response::NotImplemented {
             op: "restart".into(),
         },
-        Request::Logs { .. } => Response::NotImplemented {
-            op: "logs".into(),
+        Request::Logs { child, tail } => match crate::tail_child_log(&child, tail) {
+            Ok(lines) => Response::Logs { child, lines },
+            Err(e) => Response::Error {
+                message: format!("tail {child}: {e}"),
+            },
         },
         Request::Say { .. } => Response::NotImplemented { op: "say".into() },
     }
@@ -484,10 +491,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn dispatch_mute_returns_not_implemented_with_op_name() {
+    async fn dispatch_mute_acks_and_flips_state() {
         let state = Mutex::new(SupervisorView::pending_for(&canonical_children()));
+        assert!(!state.lock().await.muted);
         let resp = dispatch(Request::Mute, &state).await;
-        assert_eq!(resp, Response::NotImplemented { op: "mute".into() });
+        assert_eq!(resp, Response::Ack);
+        assert!(state.lock().await.muted);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_unmute_acks_and_clears_state() {
+        let mut view = SupervisorView::pending_for(&canonical_children());
+        view.muted = true;
+        let state = Mutex::new(view);
+        let resp = dispatch(Request::Unmute, &state).await;
+        assert_eq!(resp, Response::Ack);
+        assert!(!state.lock().await.muted);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_mute_then_unmute_toggles_muted() {
+        let state = Mutex::new(SupervisorView::pending_for(&canonical_children()));
+        assert_eq!(dispatch(Request::Mute, &state).await, Response::Ack);
+        assert!(state.lock().await.muted);
+        assert_eq!(dispatch(Request::Unmute, &state).await, Response::Ack);
+        assert!(!state.lock().await.muted);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_status_after_mute_reflects_muted_flag() {
+        let state = Mutex::new(SupervisorView::pending_for(&canonical_children()));
+        let _ = dispatch(Request::Mute, &state).await;
+        let resp = dispatch(Request::Status, &state).await;
+        match resp {
+            Response::Status { view } => assert!(view.muted),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_logs_returns_empty_for_unknown_child() {
+        let state = Mutex::new(SupervisorView::pending_for(&canonical_children()));
+        let resp = dispatch(
+            Request::Logs {
+                child: "wm-nonexistent-7d3f9c".into(),
+                tail: 5,
+            },
+            &state,
+        )
+        .await;
+        match resp {
+            Response::Logs { child, lines } => {
+                assert_eq!(child, "wm-nonexistent-7d3f9c");
+                assert!(lines.is_empty(), "missing log file should yield empty tail");
+            }
+            other => panic!("expected Response::Logs, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

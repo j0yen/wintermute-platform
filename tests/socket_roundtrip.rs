@@ -47,7 +47,7 @@ async fn status_roundtrip_returns_five_pending_children() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mute_request_returns_not_implemented() {
+async fn mute_request_acks_and_status_reports_muted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sock = dir.path().join("init.sock");
 
@@ -62,13 +62,31 @@ async fn mute_request_returns_not_implemented() {
         .await
         .expect("client roundtrip timed out")
         .expect("client roundtrip failed");
+    assert_eq!(resp, Response::Ack);
 
-    assert_eq!(
-        resp,
-        Response::NotImplemented {
-            op: "mute".to_string()
-        }
-    );
+    let status = timeout(Duration::from_secs(2), client_roundtrip(&sock, &Request::Status))
+        .await
+        .expect("status roundtrip timed out")
+        .expect("status roundtrip failed");
+    let Response::Status { view } = status else {
+        panic!("expected Status, got {status:?}");
+    };
+    assert!(view.muted, "muted flag should be set after Mute");
+
+    let unmute = timeout(Duration::from_secs(2), client_roundtrip(&sock, &Request::Unmute))
+        .await
+        .expect("unmute roundtrip timed out")
+        .expect("unmute roundtrip failed");
+    assert_eq!(unmute, Response::Ack);
+
+    let status2 = timeout(Duration::from_secs(2), client_roundtrip(&sock, &Request::Status))
+        .await
+        .expect("status2 roundtrip timed out")
+        .expect("status2 roundtrip failed");
+    let Response::Status { view: v2 } = status2 else {
+        panic!("expected Status, got {status2:?}");
+    };
+    assert!(!v2.muted, "muted flag should clear after Unmute");
 
     server.abort();
     let _ = server.await;

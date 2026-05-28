@@ -116,15 +116,22 @@ async fn one_shot_command(req: Request) -> anyhow::Result<()> {
         Response::Status { .. } => {
             eprintln!("wm: unexpected status payload for command");
         }
+        Response::Logs { lines, .. } => render_logs(&lines),
     }
     Ok(())
+}
+
+fn render_logs(lines: &[String]) {
+    for line in lines {
+        println!("{line}");
+    }
 }
 
 fn render_status_response(resp: &Response, json: bool) {
     match resp {
         Response::Status { view } => render_status(view, json),
         Response::Error { message } => eprintln!("wm: server error: {message}"),
-        Response::Ack | Response::NotImplemented { .. } => {
+        Response::Ack | Response::NotImplemented { .. } | Response::Logs { .. } => {
             eprintln!("wm: unexpected response for status request");
         }
     }
@@ -214,6 +221,7 @@ mod tests {
                 last_event: None,
                 child_pid: None,
             }],
+            muted: false,
         };
         // Smoke: should not panic. (Real assertion is the run-time check
         // that the function recognises every Response variant.)
@@ -221,5 +229,18 @@ mod tests {
         render_status_response(&Response::Ack, false);
         render_status_response(&Response::Error { message: "x".into() }, false);
         render_status_response(&Response::NotImplemented { op: "mute".into() }, false);
+        render_status_response(
+            &Response::Logs {
+                child: "wm-audio".into(),
+                lines: vec!["x".into()],
+            },
+            false,
+        );
+    }
+
+    #[test]
+    fn render_logs_smoke() {
+        render_logs(&[]);
+        render_logs(&["alpha".into(), "beta".into(), "gamma".into()]);
     }
 }

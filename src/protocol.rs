@@ -51,6 +51,13 @@ pub enum Response {
     },
     /// Generic acknowledgement for commands without a payload.
     Ack,
+    /// Tail of a per-child stderr log.
+    Logs {
+        /// Child name echoed from the request.
+        child: String,
+        /// Tail lines in original file order, oldest first.
+        lines: Vec<String>,
+    },
     /// Server understood the op but has not wired it yet.
     NotImplemented {
         /// Echoed op name from the request.
@@ -70,6 +77,11 @@ pub struct SupervisorView {
     pub protocol_version: u32,
     /// One entry per child, in canonical startup order.
     pub children: Vec<ChildState>,
+    /// Whether the supervisor is currently muted (TTS halted, wake handling
+    /// suspended). Toggled by `Request::Mute` / `Request::Unmute`. Serde-default
+    /// so older snapshots without the field still deserialize cleanly.
+    #[serde(default)]
+    pub muted: bool,
 }
 
 /// Per-child lifecycle state surfaced to `wm`.
@@ -131,6 +143,7 @@ impl SupervisorView {
         Self {
             protocol_version: PROTOCOL_VERSION,
             children: specs.iter().map(ChildState::pending_from).collect(),
+            muted: false,
         }
     }
 }
@@ -198,6 +211,20 @@ mod tests {
             assert_eq!(v.children.len(), 5);
             assert!(v.children.iter().all(|c| c.status == ChildStatus::Pending));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn response_logs_roundtrip_preserves_child_and_lines() -> Result<(), serde_json::Error> {
+        let resp = Response::Logs {
+            child: "wm-stt".into(),
+            lines: vec!["one".into(), "two".into(), "three".into()],
+        };
+        let json = serde_json::to_string(&resp)?;
+        assert!(json.contains(r#""kind":"logs""#));
+        assert!(json.contains(r#""child":"wm-stt""#));
+        let back: Response = serde_json::from_str(&json)?;
+        assert_eq!(resp, back);
         Ok(())
     }
 
