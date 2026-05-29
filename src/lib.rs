@@ -7,10 +7,16 @@
 //! opt-ins via `--spawn` to run `start_all` + a 1 s observation loop.
 //! Restart policy, mute plumbing, log tailing, and agorabus publishing
 //! land in iter-6+.
+//!
+//! Iter-6 surface: [`ready`] — device-level readiness beacon (`wm ready`).
+//! Checks brain API key, `wintermute.target`, audio, agorabus, and unit
+//! presence. Emits a `wm.health.ready` envelope compatible with
+//! companion-degrade's `wm.health.*` design.
 
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod protocol;
+pub mod ready;
 pub mod spawn;
 pub mod supervisor;
 

@@ -1,0 +1,21 @@
+[Unit]
+Description=Wintermute boot readiness beacon
+Documentation=https://github.com/j0yen/wintermute-platform
+After=wintermute.target wmd-init.service
+Requires=wintermute.target
+PartOf=wintermute.target
+
+# Runs once on boot after the fleet starts; speaks a one-line verdict via
+# wm-tts if ready, or names the worst-failing subsystem if not.
+# Distinct from companion-degrade's mid-conversation failure voice.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'if wm ready --format text; then wm say "Wintermute is ready"; fi'
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wintermute-ready
+
+[Install]
+WantedBy=wintermute.target

@@ -4,19 +4,49 @@
 //! control plane and renders the snapshot (table or `--json`). All other
 //! subcommands route through the protocol too but the server still
 //! answers `NotImplemented`; surfaced to the user as a one-line hint.
+//!
+//! Iter-6 adds: `wm ready` — device-level readiness beacon. Checks the
+//! API key, `wintermute.target`, audio, agorabus, and canonical unit presence.
+//! Exits 0 when ready, nonzero when not. Output: human text by default,
+//! `--format json` for the `wm.health.ready` envelope.
+//!
+//! **Boot vs conversation phrase-bank boundary:** boot/deploy phrases live
+//! here in `wintermute-platform`; mid-conversation failure phrases belong
+//! in `wm-brain` (companion-degrade). They must not share a bank unless
+//! explicitly consolidated by a follow-on PRD.
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing::error;
 
 use wintermute_platform::protocol::{ChildStatus, Request, Response, SupervisorView};
+use wintermute_platform::ready::{
+    aggregate, check_audio, check_brain, check_bus, check_target, check_units,
+    not_ready_phrase, real_cmd_runner, utc_timestamp, verdict_line, HealthReadyEnvelope,
+    BOOT_PHRASE_READY,
+};
 use wintermute_platform::socket_path;
 use wintermute_platform::supervisor::client_roundtrip;
 
 const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Output format for `wm ready`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReadyFormat {
+    /// Human-readable text (`READY` or `NOT READY: <reasons>`).
+    Text,
+    /// JSON — emits the `wm.health.ready` envelope.
+    Json,
+}
+
+impl Default for ReadyFormat {
+    fn default() -> Self {
+        Self::Text
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "wm", version = CRATE_VERSION, about = "wintermute supervisor CLI")]
@@ -57,6 +87,17 @@ enum Cmd {
         /// One or more words; joined with a single space.
         text: Vec<String>,
     },
+    /// Check device readiness: API key, target, audio, bus, and unit presence.
+    ///
+    /// Exits 0 when all checks pass (READY), 1 when any check fails (NOT READY).
+    /// The spoken boot verdict is chosen from the boot phrase bank (platform-
+    /// owned); mid-conversation failure phrases belong in wm-brain (companion-
+    /// degrade), not here.
+    Ready {
+        /// Output format: `text` (default) or `json` (wm.health.ready envelope).
+        #[arg(long, value_enum, default_value_t = ReadyFormat::Text)]
+        format: ReadyFormat,
+    },
 }
 
 fn main() -> ExitCode {
@@ -72,7 +113,7 @@ fn main() -> ExitCode {
         }
     };
     match rt.block_on(run(cli)) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             error!(error = %e, "wm failed");
             eprintln!("wm: {e}");
@@ -81,11 +122,10 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> anyhow::Result<()> {
+async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.cmd {
         Cmd::Version => {
             println!("wm {CRATE_VERSION}");
-            return Ok(());
         }
         Cmd::Status { json } => {
             let resp = client_roundtrip(&socket_path(), &Request::Status).await?;
@@ -99,8 +139,59 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let utterance = text.join(" ");
             one_shot_command(Request::Say { text: utterance }).await?;
         }
+        Cmd::Ready { format } => {
+            return Ok(run_ready(format));
+        }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Run all readiness checks and render the result.
+/// Returns `ExitCode::SUCCESS` (0) when ready, `ExitCode::FAILURE` (1) when not.
+fn run_ready(format: ReadyFormat) -> ExitCode {
+    let run = real_cmd_runner();
+
+    let checks = vec![
+        check_brain(None),
+        check_target(&run),
+        check_audio(&run),
+        check_bus(None),
+        check_units(),
+    ];
+
+    let (ready, worst) = aggregate(&checks);
+
+    let failing: Vec<&str> = checks.iter().filter(|c| !c.ok).map(|c| c.name.as_str()).collect();
+    let line = verdict_line(ready, &failing);
+    let ts = utc_timestamp();
+
+    match format {
+        ReadyFormat::Text => {
+            println!("{line}");
+            if !ready {
+                if let Some(ref w) = worst {
+                    let phrase = not_ready_phrase(w.as_str());
+                    println!("{phrase}");
+                }
+            }
+        }
+        ReadyFormat::Json => {
+            let env = HealthReadyEnvelope {
+                topic: "wm.health.ready".to_string(),
+                ts,
+                ready,
+                checks: checks.clone(),
+                worst_reason: worst.clone(),
+                ready_phrase: if ready { Some(BOOT_PHRASE_READY.to_string()) } else { None },
+            };
+            match serde_json::to_string_pretty(&env) {
+                Ok(s) => println!("{s}"),
+                Err(e) => eprintln!("wm ready: serialize: {e}"),
+            }
+        }
+    }
+
+    if ready { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 async fn one_shot_command(req: Request) -> anyhow::Result<()> {
@@ -242,5 +333,10 @@ mod tests {
     fn render_logs_smoke() {
         render_logs(&[]);
         render_logs(&["alpha".into(), "beta".into(), "gamma".into()]);
+    }
+
+    #[test]
+    fn ready_format_default_is_text() {
+        assert_eq!(ReadyFormat::default(), ReadyFormat::Text);
     }
 }
