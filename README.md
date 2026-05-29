@@ -83,6 +83,28 @@ wmd`; audio first because everything subscribes to its events, tts
 before stt so the first-boot greeting can play immediately, dialog
 before wmd so the brain can gate verbal confirmations.
 
+## Hardware reality verification
+
+ACs 1, 2, 5, 8 are OS/hardware-bound (bringing up the live systemd-user
+Fleet 1 target in dependency order, cold-reboot-to-greeting wall-clock
+timing, real TTS halt within 200 ms, supervisor backoff under a real
+restart storm). They are declared in the PRD's `deferred_acs:` +
+`mock_unjustified_for:` frontmatter with a one-sentence justification
+each, because an in-process fake would reimplement systemd's transaction
+engine and assert our own math rather than the OS's real lifecycle
+behavior.
+
+To validate them against real hardware, run:
+
+```sh
+cargo test --features=real-hardware
+```
+
+This feature is opt-in and off by default, so `cargo test` stays green on
+hosts without the live systemd-user target. The drift-report sweep that
+compares mock vs. real-hardware outcomes (`hardware-drift.json`) is
+scaffolded as a follow-on PRD and is not invoked by default.
+
 ## License
 
 Dual-licensed MIT or Apache-2.0 at your option.
