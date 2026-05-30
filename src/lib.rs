@@ -15,6 +15,7 @@ pub mod protocol;
 pub mod ready;
 pub mod spawn;
 pub mod supervisor;
+pub mod watchdog;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;

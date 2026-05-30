@@ -9,6 +9,11 @@ Type=notify
 ExecStart=/usr/local/bin/wmd-init
 Restart=always
 RestartSec=2
+# Disable systemd's built-in start-limit so a transient flap never reaches
+# start-limit-hit permanently. wintermute-watchdog is the backstop: it
+# detects failed state, reset-fails, and restarts with capped exponential
+# backoff (ceiling: MAX_BACKOFF_SECS=300s, give-up: 8 attempts).
+StartLimitIntervalSec=0
 EnvironmentFile=/etc/wintermute/conf.d/00-bootstrap.env
 NotifyAccess=main
 TimeoutStartSec=30

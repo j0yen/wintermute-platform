@@ -1,0 +1,18 @@
+[Unit]
+Description=wintermute unit recovery watchdog (wintermute-watchdog)
+Documentation=https://github.com/j0yen/wintermute-platform
+# Start after the target so the fleet is populated before we scan it.
+After=wintermute.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wintermute-watchdog
+Restart=always
+RestartSec=5
+# The watchdog is its own backstop; disable systemd's start-limit so a
+# crash-loop during startup doesn't permanently kill our recovery daemon.
+# The watchdog enforces capped backoff (MAX_BACKOFF_SECS=300s) internally.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=wintermute.target
