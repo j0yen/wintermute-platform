@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.0 — 2026-05-30
+
+Extends wintermute-platform's wm binary with a wm doctor subcommand that enumerates every wintermute systemd unit, resolves ExecStart specifiers, verifies binary existence/executability, reports enabled/active/in-target status, and exits nonzero when any unit's binary is missing.
+
 ## v0.4.0 — 2026-05-30
 
 Ships wintermute-watchdog: detects wintermute units in failed state, clears
