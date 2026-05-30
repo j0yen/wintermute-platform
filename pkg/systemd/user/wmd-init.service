@@ -6,7 +6,7 @@ ConditionPathExists=/etc/wintermute/conf.d/00-bootstrap.env
 
 [Service]
 Type=notify
-ExecStart=/usr/local/bin/wmd-init
+ExecStart=%h/.local/bin/wmd-init
 Restart=always
 RestartSec=2
 # Disable systemd's built-in start-limit so a transient flap never reaches

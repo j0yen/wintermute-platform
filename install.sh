@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # install.sh — wintermute-platform installer.
 #
+# INSTALL-PATH CONVENTION (PRD-wintermute-install-path-convention):
+#   All user-scope fleet binaries land in ~/.local/bin/.
+#   All user-scope systemd unit ExecStart= lines use %h/.local/bin/<binary>.
+#   This script enforces the convention idempotently for platform-owned units
+#   (wmd-init.service) and gates a successful install on `wm doctor` exiting 0.
+#   Re-running this script on an already-installed fleet converges to the same
+#   state without errors.
+#
 # Two install modes:
 #   default              developer install (binaries to ~/.local/bin/)
 #   --kiosk              kiosk install (binaries to /usr/local/bin/,
@@ -45,8 +53,15 @@ while [ $# -gt 0 ]; do
             cat <<EOF
 usage: install.sh [--kiosk|--uninstall-kiosk] [--dry-run] [--user NAME]
 
+Install-path convention: ~/.local/bin/ (user-scope fleet, all modes).
+  All fleet binaries are installed to ~/.local/bin/.
+  All user-scope unit ExecStart= lines are rewritten to %h/.local/bin/<binary>.
+  The install is gated on \`wm doctor\` exiting 0 (unless --dry-run).
+
 Modes:
   default              dev install: cargo install --path . --root ~/.local
+                       + reconcile unit files to convention
+                       + gate on \`wm doctor\` exit 0
   --kiosk              kiosk install: /usr/local/bin/ + greetd autologin +
                        boot-recovery service + tmpfiles.d + enable-linger
   --uninstall-kiosk    revert kiosk wiring; leave wm-* binaries intact
@@ -147,12 +162,76 @@ render_tmpfiles_rule() {
 
 # --- Dev install (no --kiosk and no --uninstall-kiosk) ---------------
 
+# Reconcile one systemd unit file to the ~/.local/bin convention.
+# Idempotent: if ExecStart already uses %h/.local/bin/ the file is left
+# unchanged. Uses sed to rewrite ExecStart= lines in-place.
+reconcile_unit_file() {
+    local unit_file="$1"
+    if [ ! -f "$unit_file" ]; then
+        return 0
+    fi
+    if [ $DRY_RUN -eq 1 ]; then
+        printf '  DRY-RUN: reconcile ExecStart in %s to %%h/.local/bin/\n' "$unit_file"
+        return 0
+    fi
+    # Rewrite: replace /usr/local/bin/<binary>, %h/.cargo/bin/<binary>, ~/.cargo/bin/<binary>
+    # with %h/.local/bin/<binary>. Preserves argument tails.
+    sed -i \
+        -e 's|^ExecStart=/usr/local/bin/\([^ ]*\)|ExecStart=%h/.local/bin/\1|' \
+        -e 's|^ExecStart=%h/\.cargo/bin/\([^ ]*\)|ExecStart=%h/.local/bin/\1|' \
+        -e 's|^ExecStart=~/.cargo/bin/\([^ ]*\)|ExecStart=%h/.local/bin/\1|' \
+        "$unit_file"
+    log "reconciled $unit_file"
+}
+
 dev_install() {
     log "dev install: cargo install --path . --root ~/.local"
+    log "convention: all fleet binaries -> ~/.local/bin/ (PRD-wintermute-install-path-convention)"
     runit cargo install --path "$SCRIPT_DIR" --root "$HOME/.local"
+
+    # Reconcile platform-owned user-scope unit files to the convention.
+    # The units under pkg/systemd/user/ are already correct (source-of-truth);
+    # the installed copies under ~/.config/systemd/user/ may be stale.
+    local user_unit_dir="$HOME/.config/systemd/user"
+    if [ -d "$user_unit_dir" ]; then
+        log "reconciling user-scope unit files in $user_unit_dir"
+        for unit_file in "$user_unit_dir"/wmd-init.service \
+                         "$user_unit_dir"/wm-audio.service \
+                         "$user_unit_dir"/wm-tts.service \
+                         "$user_unit_dir"/wm-stt.service \
+                         "$user_unit_dir"/wm-dialog.service \
+                         "$user_unit_dir"/wmd.service \
+                         "$user_unit_dir"/wintermute-ready.service; do
+            reconcile_unit_file "$unit_file"
+        done
+        if [ $DRY_RUN -eq 0 ]; then
+            runit systemctl --user daemon-reload || true
+            log "systemd user daemon reloaded"
+        fi
+    fi
+
     if [ -x "$SCRIPT_DIR/pkg/install-system.sh" ]; then
         log "running pkg/install-system.sh (systemd units, wintermute-session)"
         runit sudo "$SCRIPT_DIR/pkg/install-system.sh"
+    fi
+
+    # Doctor gate: the install cannot declare success while the fleet is broken.
+    if [ $DRY_RUN -eq 0 ]; then
+        local wm_bin="$HOME/.local/bin/wm"
+        if [ -x "$wm_bin" ]; then
+            log "running wm doctor (gate: all fleet checks must pass)"
+            if ! "$wm_bin" doctor; then
+                log "ERROR: wm doctor reported failures — install did not fully succeed."
+                log "Run: wm doctor  (for details)"
+                exit 1
+            fi
+            log "wm doctor passed — install complete."
+        else
+            log "WARNING: wm binary not found at $wm_bin; skipping doctor gate."
+            log "Re-run install.sh after the build completes to enforce the gate."
+        fi
+    else
+        printf '  DRY-RUN: wm doctor (gate: would run if wet)\n'
     fi
 }
 
