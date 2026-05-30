@@ -109,13 +109,10 @@ pub fn not_ready_phrase(check_name: &str) -> &'static str {
 /// `WM_BOOTSTRAP_ENV` in the test environment or pass `Some(path)`).
 #[must_use]
 pub fn check_brain(env_path_override: Option<&Path>) -> CheckResult {
-    let path: PathBuf = env_path_override.map_or_else(
-        resolve_bootstrap_env_path,
-        |p| p.to_owned(),
-    );
+    let path: PathBuf = env_path_override.map_or_else(resolve_bootstrap_env_path, Path::to_owned);
     match EnvConfig::load_optional(&path) {
         Ok(Some(cfg)) => {
-            let key = cfg.keys.get("WM_ANTHROPIC_API_KEY").map(String::as_str).unwrap_or("");
+            let key = cfg.keys.get("WM_ANTHROPIC_API_KEY").map_or("", String::as_str);
             if key.is_empty() {
                 CheckResult {
                     name: CHECK_BRAIN.to_string(),
@@ -221,10 +218,8 @@ pub fn check_audio(run: &CmdRunner) -> CheckResult {
 /// we can connect to it). We use a simple existence + connect probe.
 #[must_use]
 pub fn check_bus(bus_socket_path_override: Option<&Path>) -> CheckResult {
-    let path: PathBuf = bus_socket_path_override.map_or_else(
-        default_bus_socket_path,
-        |p| p.to_owned(),
-    );
+    let path: PathBuf =
+        bus_socket_path_override.map_or_else(default_bus_socket_path, Path::to_owned);
     if !path.exists() {
         return CheckResult {
             name: CHECK_BUS.to_string(),
@@ -246,8 +241,7 @@ pub fn check_bus(bus_socket_path_override: Option<&Path>) -> CheckResult {
 fn default_bus_socket_path() -> PathBuf {
     // Standard agorabus socket location.
     let xdg = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+        .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     xdg.join("agorabus").join("bus.sock")
 }
 
@@ -371,7 +365,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     (y, mo, days + 1)
 }
 
-fn is_leap(y: u64) -> bool {
+const fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }
 
