@@ -16,6 +16,8 @@ ExecStart=/bin/sh -c 'if wm ready --format text; then wm say "Wintermute is read
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=wintermute-ready
+# Disable start-limit — wintermute-watchdog handles fleet recovery.
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=wintermute.target

@@ -67,6 +67,10 @@ path = "src/bin/wmd_init.rs"
 name = "wm"
 path = "src/bin/wm.rs"
 
+[[bin]]
+name = "wintermute-watchdog"
+path = "src/bin/wintermute_watchdog.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
