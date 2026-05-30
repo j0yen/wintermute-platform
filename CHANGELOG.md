@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.0 — 2026-05-30
+
+Enforces one install-path convention (~/.local/bin/) across all user-scope
+wintermute fleet binaries. Fixes wmd-init dead-service (ExecStart mismatch).
+Adds install_convention module with FLEET_INSTALL_DIR constant, idempotent
+plan_install, rewrite_unit_exec_starts, check_unit_convention functions.
+Updates install.sh with reconcile_unit_file() and wm doctor gate.
+
 ## v0.5.0 — 2026-05-30
 
 Extends wintermute-platform's wm binary with a wm doctor subcommand that enumerates every wintermute systemd unit, resolves ExecStart specifiers, verifies binary existence/executability, reports enabled/active/in-target status, and exits nonzero when any unit's binary is missing.
