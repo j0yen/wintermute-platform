@@ -25,6 +25,7 @@ use tracing::error;
 use wintermute_platform::doctor::{
     real_cmd_runner as doctor_cmd_runner, render_table, run_doctor, DoctorScope,
 };
+use wintermute_platform::install_convention::FLEET_INSTALL_DIR;
 use wintermute_platform::protocol::{ChildStatus, Request, Response, SupervisorView};
 use wintermute_platform::ready::{
     aggregate, check_audio, check_brain, check_bus, check_target, check_units,
@@ -133,6 +134,9 @@ enum Cmd {
     /// executable file. Exits 2 when any unit's binary is missing or
     /// non-executable. A unit that is inactive or disabled but whose binary
     /// exists is NOT a failure.
+    ///
+    /// Also reports the fleet install-path convention (`~/.local/bin/`) used
+    /// by install.sh (PRD-wintermute-install-path-convention).
     Doctor {
         /// Output format: `table` (default, human-readable) or `json`.
         #[arg(long, value_enum, default_value_t = DoctorFormat::Table)]
@@ -250,6 +254,9 @@ fn run_ready(format: ReadyFormat) -> ExitCode {
 ///
 /// Returns `ExitCode::SUCCESS` (0) when all binaries are present and
 /// executable. Returns `ExitCode::from(2)` when any binary is missing.
+///
+/// Also prints the fleet install-path convention (`~/.local/bin/`)
+/// as a header note (PRD-wintermute-install-path-convention).
 fn run_doctor_cmd(format: DoctorFormat, scope: DoctorScopeArg, quiet: bool) -> ExitCode {
     let doctor_scope = match scope {
         DoctorScopeArg::User => DoctorScope::User,
@@ -261,6 +268,7 @@ fn run_doctor_cmd(format: DoctorFormat, scope: DoctorScopeArg, quiet: bool) -> E
 
     match format {
         DoctorFormat::Table => {
+            println!("fleet install-path convention: {FLEET_INSTALL_DIR}");
             let table = render_table(&report, quiet);
             print!("{table}");
         }

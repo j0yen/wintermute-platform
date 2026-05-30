@@ -11,6 +11,7 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod doctor;
+pub mod install_convention;
 pub mod kiosk;
 pub mod protocol;
 pub mod ready;
