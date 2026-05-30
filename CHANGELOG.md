@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.0 — 2026-05-30
+
+Ships wintermute-watchdog: detects wintermute units in failed state, clears
+them, and restarts with capped exponential backoff (2s→300s, give-up after 8
+attempts, wm.health.* event on give-up). Tunes fleet units with
+StartLimitIntervalSec=0 so a transient flap never permanently bricks a unit
+before the watchdog can act.
+
 ## v0.3.0 — 2026-05-29
 
 Add kiosk-mode boot path for zero-keyboard deployments. `install.sh --kiosk`
