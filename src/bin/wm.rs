@@ -22,6 +22,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing::error;
 
+use wintermute_platform::doctor::{
+    real_cmd_runner as doctor_cmd_runner, render_table, run_doctor, DoctorScope,
+};
 use wintermute_platform::protocol::{ChildStatus, Request, Response, SupervisorView};
 use wintermute_platform::ready::{
     aggregate, check_audio, check_brain, check_bus, check_target, check_units,
@@ -46,6 +49,31 @@ impl Default for ReadyFormat {
     fn default() -> Self {
         Self::Text
     }
+}
+
+/// Output format for `wm doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum DoctorFormat {
+    /// Human-readable table (default).
+    #[default]
+    Table,
+    /// JSON — one object per unit, plus a summary object.
+    Json,
+}
+
+/// Scope for `wm doctor` — which systemd manager(s) to query.
+///
+/// Default is `user` to avoid requiring privilege; pass `system` or `both`
+/// explicitly when inspecting system-scope units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum DoctorScopeArg {
+    /// User manager only (`systemctl --user`).
+    #[default]
+    User,
+    /// System manager only (`systemctl --system`).
+    System,
+    /// Both user and system managers.
+    Both,
 }
 
 #[derive(Parser, Debug)]
@@ -98,6 +126,27 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = ReadyFormat::Text)]
         format: ReadyFormat,
     },
+    /// Inspect every wintermute systemd unit: resolve `ExecStart`, verify binary
+    /// exists and is executable, report enabled/active/in-target status.
+    ///
+    /// Exits 0 only when every discovered unit's `ExecStart` resolves to an
+    /// executable file. Exits 2 when any unit's binary is missing or
+    /// non-executable. A unit that is inactive or disabled but whose binary
+    /// exists is NOT a failure.
+    Doctor {
+        /// Output format: `table` (default, human-readable) or `json`.
+        #[arg(long, value_enum, default_value_t = DoctorFormat::Table)]
+        format: DoctorFormat,
+        /// Which systemd scope(s) to query: `user` (default), `system`, or `both`.
+        ///
+        /// System-scope queries do not require root for `cat`/`is-enabled` but
+        /// may be unavailable in some CI environments; default is `user`.
+        #[arg(long, value_enum, default_value_t = DoctorScopeArg::User)]
+        scope: DoctorScopeArg,
+        /// Print only failing units (units with missing or non-executable binaries).
+        #[arg(long)]
+        quiet: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -142,6 +191,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::Ready { format } => {
             return Ok(run_ready(format));
         }
+        Cmd::Doctor { format, scope, quiet } => {
+            return Ok(run_doctor_cmd(format, scope, quiet));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -181,7 +233,7 @@ fn run_ready(format: ReadyFormat) -> ExitCode {
                 ts,
                 ready,
                 checks: checks.clone(),
-                worst_reason: worst.clone(),
+                worst_reason: worst,
                 ready_phrase: if ready { Some(BOOT_PHRASE_READY.to_string()) } else { None },
             };
             match serde_json::to_string_pretty(&env) {
@@ -192,6 +244,39 @@ fn run_ready(format: ReadyFormat) -> ExitCode {
     }
 
     if ready { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// Run `wm doctor`: enumerate units, check binaries, render output.
+///
+/// Returns `ExitCode::SUCCESS` (0) when all binaries are present and
+/// executable. Returns `ExitCode::from(2)` when any binary is missing.
+fn run_doctor_cmd(format: DoctorFormat, scope: DoctorScopeArg, quiet: bool) -> ExitCode {
+    let doctor_scope = match scope {
+        DoctorScopeArg::User => DoctorScope::User,
+        DoctorScopeArg::System => DoctorScope::System,
+        DoctorScopeArg::Both => DoctorScope::Both,
+    };
+    let run = doctor_cmd_runner();
+    let report = run_doctor(doctor_scope, &run, None, None, None);
+
+    match format {
+        DoctorFormat::Table => {
+            let table = render_table(&report, quiet);
+            print!("{table}");
+        }
+        DoctorFormat::Json => {
+            match serde_json::to_string_pretty(&report) {
+                Ok(s) => println!("{s}"),
+                Err(e) => eprintln!("wm doctor: serialize: {e}"),
+            }
+        }
+    }
+
+    if report.all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    }
 }
 
 async fn one_shot_command(req: Request) -> anyhow::Result<()> {
